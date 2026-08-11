@@ -1,0 +1,264 @@
+openapi: 3.0.3
+info:
+  title: Life Search - Local Search API
+  version: 0.1.0
+  description: Local HTTP API for the Life Search MVP (desktop app). Default localhost-only usage.
+servers:
+  - url: http://127.0.0.1:30013
+paths:
+  /search:
+    post:
+      summary: Run a natural-language search and return ranked results
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SearchRequest'
+      responses:
+        '200':
+          description: Search results
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SearchResponse'
+  /document/{documentId}:
+    get:
+      summary: Retrieve document metadata and optional extracted text
+      parameters:
+        - name: documentId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Document metadata
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DocumentResponse'
+  /index:
+    post:
+      summary: Trigger reindexing for provided paths (on-demand)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                paths:
+                  type: array
+                  items:
+                    type: string
+                  description: Absolute paths to reindex
+                priority:
+                  type: boolean
+                  description: Whether to prioritize this reindex
+      responses:
+        '202':
+          description: Reindex scheduled
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: scheduled
+  /status:
+    get:
+      summary: Get indexer and index status
+      responses:
+        '200':
+          description: Status
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StatusResponse'
+  /feedback:
+    post:
+      summary: Submit user feedback for ranking tuning
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/FeedbackRequest'
+      responses:
+        '200':
+          description: Feedback recorded
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                    example: true
+components:
+  schemas:
+    SearchRequest:
+      type: object
+      properties:
+        query:
+          type: string
+          example: "Find that PDF about Qdrant I downloaded around May"
+        filters:
+          type: object
+          properties:
+            mime_types:
+              type: array
+              items:
+                type: string
+            date_from:
+              type: integer
+              description: epoch ms
+            date_to:
+              type: integer
+              description: epoch ms
+            app_origin:
+              type: string
+            project:
+              type: string
+        k:
+          type: integer
+          description: number of results to return
+          default: 10
+    SearchResponse:
+      type: object
+      properties:
+        took_ms:
+          type: integer
+          description: milliseconds
+        query_embedding_id:
+          type: string
+          nullable: true
+        results:
+          type: array
+          items:
+            $ref: '#/components/schemas/ResultCard'
+    ResultCard:
+      type: object
+      properties:
+        document_id:
+          type: string
+        file_name:
+          type: string
+        path:
+          type: string
+        mime_type:
+          type: string
+        snippet:
+          type: string
+        highlights:
+          type: array
+          items:
+            type: string
+        score:
+          type: number
+        why:
+          type: string
+        last_opened_ms:
+          type: integer
+        thumbnail_path:
+          type: string
+    DocumentResponse:
+      type: object
+      properties:
+        document:
+          type: object
+          properties:
+            id:
+              type: string
+            path:
+              type: string
+            file_name:
+              type: string
+            mime_type:
+              type: string
+            size:
+              type: integer
+            content_hash:
+              type: string
+            created_at:
+              type: integer
+            modified_at:
+              type: integer
+            indexed_at:
+              type: integer
+            metadata_json:
+              type: string
+        extracted_text:
+          type: string
+          nullable: true
+    StatusResponse:
+      type: object
+      properties:
+        indexed_documents:
+          type: integer
+        indexed_chunks:
+          type: integer
+        last_indexed_ms:
+          type: integer
+        indexing_in_progress:
+          type: boolean
+        indexing_progress_percent:
+          type: number
+    FeedbackRequest:
+      type: object
+      properties:
+        query:
+          type: string
+        document_id:
+          type: string
+        action:
+          type: string
+          description: 'click | ignore | pin'
+          example: click
+
+security: []
+
+# Examples (example responses)
+
+x-examples:
+  searchExample:
+    summary: Example search response
+    value:
+      took_ms: 112
+      results:
+        - document_id: "doc-uuid-1"
+          file_name: "qdrant_notes.pdf"
+          path: "C:\\Users\\You\\Downloads\\qdrant_notes.pdf"
+          mime_type: "application/pdf"
+          snippet: "...Qdrant is a vector database optimized for semantic search..."
+          highlights: ["Qdrant","vector database"]
+          score: 0.923
+          why: "Matched semantically on 'Qdrant' and was recently opened on 2026-05-14"
+          last_opened_ms: 1715635200000
+          thumbnail_path: "C:\\Users\\You\\AppData\\Local\\LifeSearch\\cache\\thumbs\\doc-uuid-1.png"
+        - document_id: "doc-uuid-2"
+          file_name: "ai-receptionist-arch.docx"
+          path: "C:\\Users\\You\\Documents\\ai-receptionist-arch.docx"
+          mime_type: "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+          snippet: "...architecture uses a QLoRA fine-tuned model to reduce costs..."
+          highlights: ["QLoRA"]
+          score: 0.71
+          why: "Matched content mentioning QLoRA"
+
+  documentExample:
+    summary: Example document response
+    value:
+      document:
+        id: "doc-uuid-1"
+        path: "C:\\Users\\You\\Downloads\\qdrant_notes.pdf"
+        file_name: "qdrant_notes.pdf"
+        mime_type: "application/pdf"
+        size: 334021
+        content_hash: "abcdef123456..."
+        created_at: 1715610000000
+        modified_at: 1715613600000
+        indexed_at: 1715617200000
+        metadata_json: "{\"paths\":[\"C:\\Users\\You\\Downloads\\qdrant_notes.pdf\"]}"
+      extracted_text: "Qdrant is a vector database optimized for semantic search..."
