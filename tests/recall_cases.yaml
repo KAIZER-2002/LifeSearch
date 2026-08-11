@@ -5,7 +5,7 @@ cases:
   - id: rc-01
     query: "Find the Qdrant PDF I downloaded around May."
     expected_type: artifact
-    expected_match: "*qdrant*\.pdf"
+    expected_match: "*qdrant*\\.pdf"
     notes: "Expect download event evidence and file in Downloads"
 
   - id: rc-02
@@ -71,7 +71,7 @@ cases:
   - id: rc-12
     query: "Find that PDF I printed or saved as 'qdrant' (I don’t remember exact name)."
     expected_type: artifact
-    expected_match: "*qdrant*\.pdf"
+    expected_match: "*qdrant*\\.pdf"
     notes: "Fuzzy match on extracted text and filename"
 
   - id: rc-13

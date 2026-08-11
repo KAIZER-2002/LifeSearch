@@ -12,3 +12,5 @@ venv/
 ENV/
 .DS_Store
 Thumbs.db
+scripts/eval_results.json
+
