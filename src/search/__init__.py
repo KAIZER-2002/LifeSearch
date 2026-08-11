@@ -1,3 +1,3 @@
-from .engine import search
-__all__ = ["search"]
+from .engine import SearchEngine
 
+__all__ = ["SearchEngine"]
