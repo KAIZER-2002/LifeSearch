@@ -160,18 +160,24 @@ class ArtifactStore:
         )
         self.conn.commit()
 
-    def search_artifacts(self, query: str, limit: int = 20) -> List[Dict[str, Any]]:
+    def search_artifacts(self, query: str, limit: int = 20, mime_type_filter: Optional[str] = None) -> List[Dict[str, Any]]:
         if not query.strip():
             return []
-        cursor = self.conn.execute(
+        sql = (
             "SELECT a.id, a.path, a.file_name, a.mime_type, a.size, a.modified_at, "
             "bm25(artifact_fts) AS rank, snippet(artifact_fts, 3, '[', ']', '...', 10) AS snippet "
             "FROM artifact_fts "
             "JOIN artifacts a ON artifact_fts.rowid = a.id "
             "WHERE artifact_fts MATCH ? AND a.missing = 0 "
-            "ORDER BY rank, a.path LIMIT ?",
-            (query, limit),
         )
+        params: List[Any] = [query]
+        if mime_type_filter:
+            sql += " AND a.mime_type LIKE ?"
+            params.append(f"%{mime_type_filter}%")
+        sql += " ORDER BY rank, a.path LIMIT ?"
+        params.append(limit)
+
+        cursor = self.conn.execute(sql, params)
         return [dict(row) for row in cursor.fetchall()]
 
     def mark_missing_artifacts(self, current_paths: Iterable[str]) -> None:

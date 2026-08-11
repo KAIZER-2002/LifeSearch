@@ -22,6 +22,9 @@ class SearchResult:
         memories: Serialized summaries of associated memories.
         evidence: Typed evidence dicts for downstream consumers.
             Each item has a "type" key: "episode" or "memory".
+        result_type: Type of result item ("artifact" | "episode" | "memory"). Default "artifact".
+        score: Composite hybrid ranking score in [0.0, 1.0].
+        why: Human-readable explanation string for why this result matched.
     """
 
     id: int
@@ -35,11 +38,14 @@ class SearchResult:
     episodes: List[Dict[str, Any]] = field(default_factory=list)
     memories: List[Dict[str, Any]] = field(default_factory=list)
     evidence: List[Dict[str, Any]] = field(default_factory=list)
+    result_type: str = "artifact"
+    score: float = 0.0
+    why: str = ""
 
     # ------------------------------------------------------------------
     # Backward-compatible dict-style access
     # Allows result["file_name"] in addition to result.file_name so that
-    # existing tests written against the old Dict[str, str] interface
+    # existing tests written against the old Dict interface
     # continue to work without modification.
     # ------------------------------------------------------------------
 
@@ -56,6 +62,9 @@ class SearchResult:
             "episodes": self.episodes,
             "memories": self.memories,
             "evidence": self.evidence,
+            "result_type": self.result_type,
+            "score": self.score,
+            "why": self.why,
         }
 
     def __getitem__(self, key: str) -> Any:
