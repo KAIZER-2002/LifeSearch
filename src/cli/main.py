@@ -7,6 +7,8 @@ from typing import Optional
 from src.artifacts.extractor import Extractor
 from src.artifacts.scanner import ArtifactScanner
 from src.artifacts.store import ArtifactStore
+from src.episodes.store import EpisodeStore
+from src.memories.store import MemoryStore
 from src.search.engine import SearchEngine
 
 
@@ -38,10 +40,13 @@ def open_file(path: str) -> None:
 
 
 def build_stack(db_path: Optional[str] = None):
-    store = ArtifactStore(db_path or get_default_db_path())
+    resolved = db_path or get_default_db_path()
+    store = ArtifactStore(resolved)
     extractor = Extractor()
     scanner = ArtifactScanner(store, extractor)
-    search_engine = SearchEngine(store)
+    episode_store = EpisodeStore(resolved)
+    memory_store = MemoryStore(resolved)
+    search_engine = SearchEngine(store, episode_store, memory_store)
     return store, scanner, search_engine
 
 
@@ -68,9 +73,19 @@ def command_search(args: argparse.Namespace) -> int:
         return 0
     for artifact in results:
         print(f"[{artifact['id']}] {artifact['file_name']} - {artifact['path']}")
-        snippet = artifact.get('snippet')
+        snippet = artifact.get("snippet")
         if snippet:
             print(f"  snippet: {snippet}")
+        # Print episode/memory context only when present
+        evidence = artifact.get("evidence") or []
+        episodes = [ev for ev in evidence if ev.get("type") == "episode"]
+        memories = [ev for ev in evidence if ev.get("type") == "memory"]
+        if episodes:
+            ep = episodes[0]
+            print(f"  episode: {ep['title']} ({ep['start_ts'][:16]} – {ep['end_ts'][:16]})")
+        if memories:
+            mem = memories[0]
+            print(f"  memory: {mem['title']}")
     return 0
 
 
