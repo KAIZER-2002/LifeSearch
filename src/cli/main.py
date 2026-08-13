@@ -10,6 +10,7 @@ from src.artifacts.store import ArtifactStore
 from src.episodes.store import EpisodeStore
 from src.memories.store import MemoryStore
 from src.search.engine import SearchEngine
+from src.server.app import command_serve
 
 
 DEFAULT_DB_ENV = "LIFESEARCH_DB"
@@ -45,7 +46,10 @@ def build_stack(db_path: Optional[str] = None):
     from src.vector.store import VectorStore
 
     resolved = db_path or get_default_db_path()
-    store = ArtifactStore(resolved)
+    # check_same_thread=False: the HTTP server runs SearchEngine.search()
+    # from worker threads, so the SQLite connection must be thread-shareable.
+    # Single-threaded CLI commands are unaffected by this setting.
+    store = ArtifactStore(resolved, check_same_thread=False)
     vector_store = VectorStore(resolved)
     embedding_engine = ONNXEmbeddingEngine()
     extractor = Extractor(get_default_ocr_engine())
@@ -133,6 +137,10 @@ def create_parser() -> argparse.ArgumentParser:
     open_parser = subparsers.add_parser("open", help="Open an indexed artifact.")
     open_parser.add_argument("artifact_id", type=int, help="Artifact ID to open.")
 
+    serve_parser = subparsers.add_parser("serve", help="Start the HTTP search server.")
+    serve_parser.add_argument("--host", default="127.0.0.1", help="Host to bind to (default: 127.0.0.1)")
+    serve_parser.add_argument("--port", type=int, default=30013, help="Port to listen on (default: 30013)")
+
     return parser
 
 
@@ -147,6 +155,8 @@ def main(argv=None) -> int:
         return command_search(args)
     if args.command == "open":
         return command_open(args)
+    if args.command == "serve":
+        return command_serve(args)
     parser.print_help()
     return 1
 
