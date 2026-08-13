@@ -180,16 +180,28 @@ class ArtifactStore:
         cursor = self.conn.execute(sql, params)
         return [dict(row) for row in cursor.fetchall()]
 
-    def mark_missing_artifacts(self, current_paths: Iterable[str]) -> None:
+    def mark_missing_artifacts(self, current_paths: Iterable[str]) -> List[int]:
+        """Mark artifacts no longer present as missing.
+
+        Returns the list of artifact ids that transitioned to missing during
+        this call (so callers such as the scanner can clean up derived data
+        like vector embeddings). Existing callers that ignore the return
+        value are unaffected.
+        """
         current_set = {os.path.abspath(path) for path in current_paths}
-        existing = self.conn.execute("SELECT path FROM artifacts").fetchall()
+        newly_missing: List[int] = []
+        existing = self.conn.execute("SELECT id, path, missing FROM artifacts").fetchall()
         for row in existing:
             path = row["path"]
-            if path not in current_set and not self.is_artifact_missing(path):
+            is_present = path in current_set
+            already_missing = bool(row["missing"])
+            if not is_present and not already_missing:
                 self.conn.execute("UPDATE artifacts SET missing = 1 WHERE path = ?", (path,))
-        for path in current_set:
-            self.conn.execute("UPDATE artifacts SET missing = 0 WHERE path = ?", (path,))
+                newly_missing.append(int(row["id"]))
+            elif is_present and already_missing:
+                self.conn.execute("UPDATE artifacts SET missing = 0 WHERE path = ?", (path,))
         self.conn.commit()
+        return newly_missing
 
     def is_artifact_missing(self, path: str) -> bool:
         row = self.get_artifact_by_path(path)

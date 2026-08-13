@@ -40,19 +40,31 @@ def open_file(path: str) -> None:
 
 
 def build_stack(db_path: Optional[str] = None):
+    from src.artifacts.ocr import get_default_ocr_engine
+    from src.vector.embeddings import ONNXEmbeddingEngine
+    from src.vector.store import VectorStore
+
     resolved = db_path or get_default_db_path()
     store = ArtifactStore(resolved)
-    extractor = Extractor()
-    scanner = ArtifactScanner(store, extractor)
+    vector_store = VectorStore(resolved)
+    embedding_engine = ONNXEmbeddingEngine()
+    extractor = Extractor(get_default_ocr_engine())
+    scanner = ArtifactScanner(store, extractor, vector_store=vector_store, embedding_engine=embedding_engine)
     episode_store = EpisodeStore(resolved)
     memory_store = MemoryStore(resolved)
-    search_engine = SearchEngine(store, episode_store, memory_store)
+    search_engine = SearchEngine(
+        store,
+        episode_store=episode_store,
+        memory_store=memory_store,
+        vector_store=vector_store,
+        embedding_engine=embedding_engine,
+    )
     return store, scanner, search_engine
 
 
 def command_index(args: argparse.Namespace) -> int:
     _, scanner, _ = build_stack(args.db)
-    result = scanner.index_folder(args.folder)
+    result = scanner.index_folder(args.folder, reindex_on_model_change=args.reindex)
     print(f"Indexed {result['processed']} files, skipped {result['skipped']} unchanged files, {result['errors']} errors.")
     return 0
 
@@ -106,6 +118,11 @@ def create_parser() -> argparse.ArgumentParser:
 
     index_parser = subparsers.add_parser("index", help="Index a folder of supported artifacts.")
     index_parser.add_argument("folder", help="Folder to index.")
+    index_parser.add_argument(
+        "--reindex",
+        action="store_true",
+        help="If the embedding model changed, re-embed all artifacts with the current model.",
+    )
 
     subparsers.add_parser("status", help="Show index status.")
 

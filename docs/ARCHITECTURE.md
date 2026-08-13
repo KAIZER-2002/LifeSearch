@@ -79,7 +79,7 @@ Architecture Decisions (ADR summary)
 - ADR 002: Events→Episodes→Memories are primary abstractions.
 - ADR 003: SQLite + embedded vector index for storage (reason: embeddable, low ops overhead).
 - ADR 004: Heuristic-first episode detection with ML migration path.
-- ADR 005: Provider-independent AI layer — abstract model inference behind an adapter.
+- ADR 007: Provider-independent AI layer — abstract model inference behind an adapter.
 
 What can be extracted later
 - If the product needs to scale or move to cloud, the modular monolith can break into services: Capture Service, Index Service, Episode Service, Search API.

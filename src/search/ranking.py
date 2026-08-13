@@ -6,10 +6,11 @@ from typing import Any, Dict, List, Optional, Tuple
 from .query_parser import ParsedQuery
 from .temporal import TimeRange
 
-WEIGHT_FTS = 0.50
-WEIGHT_FILENAME = 0.20
-WEIGHT_TEMPORAL = 0.15
-WEIGHT_EPISODE = 0.10
+WEIGHT_FTS = 0.35
+WEIGHT_SEMANTIC = 0.25
+WEIGHT_FILENAME = 0.15
+WEIGHT_TEMPORAL = 0.12
+WEIGHT_EPISODE = 0.08
 WEIGHT_MEMORY = 0.05
 
 
@@ -103,6 +104,7 @@ def rank_candidates(
     for c in candidates:
         art_id = int(c["id"])
         fts_s = fts_norm_map.get(art_id, 0.0)
+        sem_s = max(0.0, float(c.get("semantic_score") or 0.0))
         fn_s = compute_filename_score(str(c.get("file_name") or ""), parsed_query.terms)
         temp_s = compute_temporal_score(str(c.get("modified_at") or ""), time_range)
         episodes = c.get("episodes") or []
@@ -112,6 +114,7 @@ def rank_candidates(
 
         total_score = (
             WEIGHT_FTS * fts_s
+            + WEIGHT_SEMANTIC * sem_s
             + WEIGHT_FILENAME * fn_s
             + WEIGHT_TEMPORAL * temp_s
             + WEIGHT_EPISODE * ep_s
@@ -125,17 +128,28 @@ def rank_candidates(
                 why_parts.append(f"Matched '{term}' in filename.")
                 break
 
-        # Check content match
+        # Check content match (FTS or Semantic)
         snippet = str(c.get("snippet") or "")
+        mime = str(c.get("mime_type") or "").lower()
+        content_matched = False
         if snippet and not any(term.lower() in str(c.get("file_name") or "").lower() for term in parsed_query.terms):
             for term in parsed_query.terms:
                 if term.lower() in snippet.lower():
-                    why_parts.append(f"Matched '{term}' in document text.")
+                    if mime.startswith("image/"):
+                        why_parts.append(f"Matched '{term}' in OCR text from screenshot.")
+                    else:
+                        why_parts.append(f"Matched '{term}' in document text.")
+                    content_matched = True
                     break
+
+        if sem_s > 0.0 and not content_matched and not any(term.lower() in str(c.get("file_name") or "").lower() for term in parsed_query.terms):
+            if mime.startswith("image/"):
+                why_parts.append(f"Semantic match to concepts in OCR text from screenshot (similarity: {sem_s:.2f}).")
+            else:
+                why_parts.append(f"Semantic match to concepts in document text (similarity: {sem_s:.2f}).")
 
         # File type match
         if parsed_query.file_type:
-            mime = str(c.get("mime_type") or "")
             if parsed_query.file_type in mime or parsed_query.file_type in str(c.get("file_name") or "").lower():
                 why_parts.append(f"File type matches '{parsed_query.file_type}'.")
 

@@ -52,8 +52,8 @@ Feedback loop
 - Record clicks/pins/ignores to re-rank future results locally. Use small-scale on-device learning (decayed weights), not centralized training.
 
 Performance targets (local desktop typical)
-- Lexical FTS query: <50ms for 100k documents (SQLite WAL, tuned indexes)
-- ANN retrieval: ~50–200ms for top-k on 100k chunks using HNSW with efSearch tuned
+- Target: Lexical FTS query <50ms for 100k documents (SQLite WAL, tuned indexes)
+- Target: ANN retrieval ~50–200ms for top-k on 100k chunks using HNSW with efSearch tuned
 - Re-ranker + explainability: <100ms
 - End-to-end: median <= 300ms; acceptable P99 <= 2s for complex queries (episode retrieval)
 

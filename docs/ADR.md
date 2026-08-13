@@ -54,13 +54,21 @@ When to revisit: If search scale or feature needs exceed SQLite performance or c
 
 ## ADR 005 — Local vector store (FAISS / hnswlib) adapter
 Decision: Provide an adapter interface to local vector stores (FAISS, hnswlib) with a pluggable implementation.
-Status: Accepted
+Status: Accepted (implemented: hnswlib primary, SQLite exact fallback)
 Context: Semantic search and retrieval rely on vector similarity; user devices vary in capability.
 Consequences:
 - + High-performance local semantic search; choice of backend per platform.
 - + Adapter allows switching backends without changing higher-level logic.
 - - Native bindings (FAISS/hnswlib) may complicate cross-platform packaging; fallback/simple JS implementations may be needed.
 When to revisit: When more portable or managed vector options become preferable, or packaging issues arise.
+
+### Implementation notes (Vector Production Hardening)
+- `VectorIndexBackend` (src/vector/backends/base.py) is the minimal adapter abstraction (add_items, search, mark_deleted, save, load, rebuild_from, count, close).
+- **Primary backend: hnswlib** (`src/vector/backends/hnsw.py`, cosine space, 384-dim MiniLM works, configurable M / ef_construction / ef_search).
+- **SQLite exact cosine search** (`src/vector/backends/sqlite_exact.py`) is the permanent, always-available fallback and the canonical source of truth (it holds the embedding BLOBs + chunk text).
+- `VectorStore` (src/vector/store.py) is a **facade** with the unchanged public contract (save_chunks / delete_artifact_chunks / search_semantic_chunks / count_chunks / close). It writes canonical data to SQLite, keeps HNSW synchronized, queries HNSW first, and **transparently falls back to exact SQLite on any ANN failure** (missing / corrupt / incompatible dimension / model mismatch / init or query error). SearchEngine and ArtifactScanner remain backend-agnostic.
+- HNSW indexes are a **derived, rebuildable cache**, persisted under `~/.lifesearch/vector_index/<db-profile>/<model_id>_<dimension>.hnsw` and keyed by (model_id, dimension) so different embedding models never cross-query. SQLite remains the recovery source for rebuilds.
+- FAISS was not added; the adapter leaves room for it as a future secondary backend.
 
 ---
 

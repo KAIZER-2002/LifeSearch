@@ -14,11 +14,11 @@ from src.artifacts.store import ArtifactStore
 
 class SearchEngine:
     """
-    Unified Contextual Search Engine (Slice 5B).
+    Unified Contextual & Semantic Search Engine (Slice 7).
 
     Combines:
       - Deterministic QueryParser & TemporalParser
-      - Candidate retrieval (FTS5, temporal episode window, activity path)
+      - Candidate retrieval (FTS5 lexical, local ONNX vector semantic, temporal episode window, activity path)
       - Episode & Memory store enrichment
       - Hybrid explainable ranking with human-readable why explanations
       - Full backward-compatibility with SearchResult dict-style access
@@ -29,10 +29,16 @@ class SearchEngine:
         artifact_store: ArtifactStore,
         episode_store: Optional[Any] = None,
         memory_store: Optional[Any] = None,
+        vector_store: Optional[Any] = None,
+        embedding_engine: Optional[Any] = None,
+        min_semantic_similarity: float = 0.35,
     ) -> None:
         self.artifact_store = artifact_store
         self.episode_store = episode_store
         self.memory_store = memory_store
+        self.vector_store = vector_store
+        self.embedding_engine = embedding_engine
+        self.min_semantic_similarity = min_semantic_similarity
         self.query_parser = QueryParser()
         self.temporal_parser = TemporalParser()
 
@@ -93,7 +99,7 @@ class SearchEngine:
         return results
 
     # ------------------------------------------------------------------
-    # Candidate Retrieval Strategy
+    # Candidate Retrieval Strategy (Lexical + Semantic + Temporal)
     # ------------------------------------------------------------------
 
     def _retrieve_candidates(
@@ -124,7 +130,7 @@ class SearchEngine:
                             cand["fts_matched"] = False
                             candidates_map[art_id] = cand
 
-        # Path 2: FTS Search (only if terms or filename_hint present)
+        # Path 2: FTS Lexical Search
         fts_term_source = parsed.filename_hint or " ".join(parsed.terms)
         if fts_term_source:
             sanitized_query = re.sub(r"[^\w\s]", " ", fts_term_source).strip()
@@ -140,7 +146,44 @@ class SearchEngine:
                         candidates_map[art_id]["snippet"] = cand.get("snippet", "")
                         candidates_map[art_id]["fts_matched"] = True
 
-        # Path 3: Temporal Window artifacts fallback (if has_temporal and not purely activity)
+        # Path 3: Local Semantic Search (if VectorStore & EmbeddingEngine present)
+        if (
+            self.vector_store is not None
+            and self.embedding_engine is not None
+            and getattr(self.embedding_engine, "dimension", 0) > 0
+            and parsed.original
+        ):
+            try:
+                query_vec = self.embedding_engine.embed_text(parsed.original)
+                if query_vec:
+                    chunk_matches = self.vector_store.search_semantic_chunks(
+                        query_embedding=query_vec,
+                        model_id=self.embedding_engine.model_id,
+                        dimension=self.embedding_engine.dimension,
+                        top_k=limit,
+                        min_similarity=self.min_semantic_similarity,
+                    )
+                    for m in chunk_matches:
+                        art_id = m.artifact_id
+                        if art_id not in candidates_map:
+                            row = self.artifact_store.get_artifact(art_id)
+                            if row and not row["missing"]:
+                                cand = dict(row)
+                                cand["rank"] = 0.0
+                                cand["snippet"] = m.text
+                                cand["fts_matched"] = False
+                                cand["semantic_score"] = m.similarity
+                                candidates_map[art_id] = cand
+                        else:
+                            prev_sim = float(candidates_map[art_id].get("semantic_score") or 0.0)
+                            candidates_map[art_id]["semantic_score"] = max(prev_sim, m.similarity)
+                            if not candidates_map[art_id].get("snippet"):
+                                candidates_map[art_id]["snippet"] = m.text
+            except Exception as sem_exc:
+                # Graceful failure isolation
+                pass
+
+        # Path 4: Temporal Window artifacts fallback
         if parsed.has_temporal and time_range and time_range.resolved and self.episode_store and len(candidates_map) < limit:
             episodes = self.episode_store.get_episodes_in_time_range(time_range.start_ts, time_range.end_ts)
             for ep in episodes:
@@ -157,7 +200,7 @@ class SearchEngine:
         return list(candidates_map.values())
 
     # ------------------------------------------------------------------
-    # Context Enrichment Helpers (Preserved from 5A)
+    # Context Enrichment Helpers (Preserved)
     # ------------------------------------------------------------------
 
     def _get_episode_summaries(self, artifact_id: int) -> List[Dict[str, Any]]:
