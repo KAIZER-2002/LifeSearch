@@ -35,6 +35,7 @@ from src.server.app import (
     init_stack,
     get_search_engine,
     get_status_info,
+    STATIC_DIR,
 )
 from src.server.mapping import (
     map_search_result,
@@ -474,6 +475,167 @@ class TestCLIBehavior:
 
         assert rc == 0
         assert "notes.txt" in captured.getvalue()
+
+
+class TestStaticServing:
+    """GET / and the static UI assets must be served from the whitelist only."""
+
+    def setup_method(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.db_path = os.path.join(self.temp_dir.name, "lifesearch.db")
+        # Ensure the DB exists; static serving does not require indexed files.
+        with ArtifactStore(self.db_path):
+            pass
+        self.port = _find_free_port()
+        self.server = LifeSearchServer(host="127.0.0.1", port=self.port)
+        self.server.start(self.db_path)
+        time.sleep(0.2)
+
+    def teardown_method(self):
+        if hasattr(self, "server"):
+            self.server.shutdown()
+        if hasattr(self, "temp_dir"):
+            self.temp_dir.cleanup()
+
+    def _get(self, path):
+        conn = HTTPConnection("127.0.0.1", self.port, timeout=5)
+        try:
+            conn.request("GET", path)
+            resp = conn.getresponse()
+            body = resp.read().decode("utf-8")
+            return resp.status, body, dict(resp.getheaders())
+        finally:
+            conn.close()
+
+    def test_get_root_returns_html(self):
+        status, body, _ = self._get("/")
+        assert status == 200
+        assert "<!DOCTYPE html>" in body or "<html" in body
+
+    def test_get_index_html_returns_html(self):
+        status, body, _ = self._get("/index.html")
+        assert status == 200
+        assert "<!DOCTYPE html>" in body
+
+    def test_static_js_served(self):
+        status, body, headers = self._get("/app.js")
+        assert status == 200
+        ctype = headers.get("Content-Type", "").lower()
+        assert "javascript" in ctype
+        assert "fetch" in body
+
+    def test_static_css_served(self):
+        status, body, headers = self._get("/styles.css")
+        assert status == 200
+        ctype = headers.get("Content-Type", "").lower()
+        assert "text/css" in ctype
+
+    def test_unknown_static_path_404(self):
+        status, _, _ = self._get("/randomfile.js")
+        assert status == 404
+
+    def test_path_traversal_404_or_400(self):
+        for path in ("/../etc/passwd", "/static/../../etc/passwd", "/..%2f..%2fetc%2fpasswd"):
+            status, _, _ = self._get(path)
+            assert status in (400, 404), path
+
+
+class TestDocumentEndpoint:
+    """GET /document/{id} exposes existing artifact metadata + text only."""
+
+    def setup_method(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.db_path = os.path.join(self.temp_dir.name, "lifesearch.db")
+        self.artifact_dir = os.path.join(self.temp_dir.name, "ws")
+        os.makedirs(self.artifact_dir)
+        create_text_file(os.path.join(self.artifact_dir, "doc.txt"), "alpha beta gamma content")
+        with ArtifactStore(self.db_path) as store:
+            scanner = ArtifactScanner(store, Extractor())
+            scanner.index_folder(self.artifact_dir)
+            row = store.get_artifact_by_path(os.path.abspath(os.path.join(self.artifact_dir, "doc.txt")))
+            self.doc_id = int(row["id"])
+
+        self.port = _find_free_port()
+        self.server = LifeSearchServer(host="127.0.0.1", port=self.port)
+        self.server.start(self.db_path)
+        time.sleep(0.2)
+
+    def teardown_method(self):
+        if hasattr(self, "server"):
+            self.server.shutdown()
+        if hasattr(self, "temp_dir"):
+            self.temp_dir.cleanup()
+
+    def _get(self, path):
+        conn = HTTPConnection("127.0.0.1", self.port, timeout=5)
+        try:
+            conn.request("GET", path)
+            resp = conn.getresponse()
+            return resp.status, resp.read().decode("utf-8")
+        finally:
+            conn.close()
+
+    def test_document_returns_metadata_and_text(self):
+        status, data = self._get("/document/" + str(self.doc_id))
+        assert status == 200
+        body = json.loads(data)
+        assert "document" in body
+        doc = body["document"]
+        assert doc["file_name"] == "doc.txt"
+        assert "extracted_text" in doc
+        assert doc["path"]
+        assert doc["mime_type"]
+
+    def test_document_unknown_404(self):
+        status, _ = self._get("/document/999999999")
+        assert status == 404
+
+    def test_document_invalid_id_400(self):
+        status, _ = self._get("/document/notanid")
+        assert status == 400
+
+
+class TestFrontendSanity:
+    """Lightweight checks that the UI is self-contained and references the API.
+
+    No browser automation; just inspects the served static files on disk.
+    """
+
+    def _read(self, name):
+        with open(os.path.join(STATIC_DIR, name), "r", encoding="utf-8") as fh:
+            return fh.read()
+
+    def test_index_references_assets(self):
+        html = self._read("index.html")
+        assert 'href="/styles.css"' in html
+        assert 'src="/app.js"' in html
+
+    def test_app_js_references_search_and_document(self):
+        js = self._read("app.js")
+        assert '"/search"' in js or "'/search'" in js
+        assert "/document/" in js
+
+    def test_required_ui_elements_exist(self):
+        html = self._read("index.html")
+        for needed in (
+            'id="search-input"',
+            'id="search-button"',
+            'id="results"',
+            'id="empty-state"',
+            'id="loading-state"',
+            'id="error-state"',
+        ):
+            assert needed in html, needed
+
+    def test_no_external_network_urls(self):
+        for name in ("index.html", "app.js", "styles.css"):
+            content = self._read(name)
+            assert "http://" not in content
+            assert "https://" not in content
+            assert "cdn." not in content
+            assert 'src="http' not in content
+            assert 'src="//' not in content
+            assert 'url(http' not in content
 
 
 if __name__ == "__main__":

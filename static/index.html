@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>LifeSearch — Local Search</title>
+  <meta name="description" content="Local-first desktop search over your indexed files." />
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <header class="app-header">
+    <div class="brand">
+      <span class="brand-mark" aria-hidden="true">&#9719;</span>
+      <span class="brand-name">LifeSearch</span>
+    </div>
+    <div class="local-badge" title="This app runs entirely on your machine and never contacts external servers.">
+      <span class="dot" aria-hidden="true"></span>
+      Local only &middot; 127.0.0.1
+    </div>
+  </header>
+
+  <main class="app-main">
+    <section class="search-section" aria-label="Search">
+      <form id="search-form" class="search-form" role="search">
+        <label for="search-input" class="visually-hidden">Search your local files</label>
+        <input
+          id="search-input"
+          name="query"
+          type="search"
+          class="search-input"
+          placeholder="Search your files, e.g. &ldquo;budget spreadsheet from March&rdquo;"
+          autocomplete="off"
+          autofocus
+        />
+        <button type="submit" id="search-button" class="search-button">Search</button>
+      </form>
+      <p id="status-line" class="status-line" role="status" aria-live="polite"></p>
+    </section>
+
+    <section id="results" class="results" aria-label="Search results" hidden></section>
+
+    <div id="empty-state" class="state empty-state">
+      <h2 class="state-title">No search yet</h2>
+      <p class="state-text">Type a query above to search across your indexed files.</p>
+    </div>
+
+    <div id="no-results-state" class="state no-results-state" hidden>
+      <h2 class="state-title">No matches</h2>
+      <p class="state-text" id="no-results-text">No results were found.</p>
+    </div>
+
+    <div id="error-state" class="state error-state" hidden>
+      <h2 class="state-title">Something went wrong</h2>
+      <p class="state-text" id="error-text">We couldn&rsquo;t complete your search. Please try again.</p>
+    </div>
+
+    <div id="loading-state" class="state loading-state" hidden aria-live="polite">
+      <div class="spinner" aria-hidden="true"></div>
+      <p class="state-text">Searching&hellip;</p>
+    </div>
+  </main>
+
+  <div id="doc-modal" class="modal" hidden role="dialog" aria-modal="true" aria-labelledby="doc-title">
+    <div class="modal-backdrop" data-close="true"></div>
+    <div class="modal-panel" role="document">
+      <header class="modal-header">
+        <h2 id="doc-title" class="modal-title">Document</h2>
+        <button type="button" class="modal-close" data-close="true" aria-label="Close detail view">&times;</button>
+      </header>
+      <div id="doc-body" class="modal-body"></div>
+    </div>
+  </div>
+
+  <script src="/app.js" defer></script>
+</body>
+</html>

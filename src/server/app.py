@@ -15,6 +15,7 @@ Security posture (Phase A):
 """
 
 import json
+import os
 import threading
 import time
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
@@ -26,6 +27,50 @@ from src.server.mapping import (
     build_status_response,
     build_error_response,
 )
+
+
+# ---------------------------------------------------------------------------
+# Static UI asset serving (Phase B)
+# ---------------------------------------------------------------------------
+# Project-root "static/" directory, resolved relative to this module so the
+# server works regardless of the current working directory.
+STATIC_DIR = os.path.abspath(
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "static")
+)
+
+# Whitelist: URL path -> (filename inside STATIC_DIR, Content-Type).
+# The URL is mapped to a FIXED filename; it is never used to build a path,
+# so directory traversal is impossible by construction.
+_STATIC_ASSETS = {
+    "/": ("index.html", "text/html; charset=utf-8"),
+    "/index.html": ("index.html", "text/html; charset=utf-8"),
+    "/app.js": ("app.js", "application/javascript; charset=utf-8"),
+    "/styles.css": ("styles.css", "text/css; charset=utf-8"),
+}
+
+
+def _resolve_static_asset(url_path: str):
+    """Return (filename, content_type) for a whitelisted asset, else None."""
+    name = url_path
+    if name.startswith("/static/"):
+        name = name[len("/static/"):]
+    elif name.startswith("/"):
+        name = name[1:]
+    if name in ("", "index.html"):
+        name = "index.html"
+    return _STATIC_ASSETS.get("/" + name)
+
+
+def _static_file_path(filename: str):
+    """Resolve a whitelisted filename to an absolute path inside STATIC_DIR.
+
+    Returns None if the resolved path would escape STATIC_DIR (defense in
+    depth); the whitelist already prevents this.
+    """
+    candidate = os.path.abspath(os.path.join(STATIC_DIR, filename))
+    if candidate != STATIC_DIR and not candidate.startswith(STATIC_DIR + os.sep):
+        return None
+    return candidate
 
 
 # The single source of truth for the running stack. init_stack() populates it
@@ -213,8 +258,10 @@ class SearchRequestHandler(BaseHTTPRequestHandler):
         parsed = self.path.split("?", 1)[0]
         if parsed == "/status":
             self._handle_status()
+        elif parsed.startswith("/document/"):
+            self._handle_document(parsed)
         else:
-            self._send_error(404, "Not Found", f"GET {parsed} not found")
+            self._handle_static(parsed)
 
     # ---- handlers --------------------------------------------------------
 
@@ -249,6 +296,66 @@ class SearchRequestHandler(BaseHTTPRequestHandler):
             self._send_json(200, response)
         except Exception:
             self._send_error(500, "Internal Server Error", "Status unavailable")
+
+    def _handle_static(self, parsed_path: str) -> None:
+        asset = _resolve_static_asset(parsed_path)
+        if asset is None:
+            self._send_error(404, "Not Found", f"GET {parsed_path} not found")
+            return
+        filename, content_type = asset
+        file_path = _static_file_path(filename)
+        if file_path is None or not os.path.isfile(file_path):
+            self._send_error(404, "Not Found", "File not found")
+            return
+        try:
+            with open(file_path, "rb") as fh:
+                data = fh.read()
+        except OSError:
+            self._send_error(404, "Not Found", "File not found")
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _handle_document(self, parsed_path: str) -> None:
+        prefix = "/document/"
+        id_part = parsed_path[len(prefix):].split("/", 1)[0]
+        if not id_part.isdigit():
+            self._send_error(400, "Bad Request", "Document id must be an integer")
+            return
+        doc_id = int(id_part)
+        try:
+            engine = get_search_engine()
+            store = getattr(engine, "artifact_store", None)
+            if store is None:
+                self._send_error(404, "Not Found", "Document not found")
+                return
+            row = store.get_artifact(doc_id)
+            if row is None:
+                self._send_error(404, "Not Found", "Document not found")
+                return
+            # Expose only existing, user-safe artifact fields. The id is
+            # validated as an integer and used for a DB lookup only; it is
+            # never interpreted as a filesystem path.
+            document = {
+                "id": row["id"],
+                "file_name": row["file_name"],
+                "path": row["path"],
+                "mime_type": row["mime_type"],
+                "size": row["size"],
+                "created_at": row["created_at"],
+                "modified_at": row["modified_at"],
+                "indexed_at": row["indexed_at"],
+                "content_hash": row["content_hash"],
+                "extracted_text": row["extracted_text"],
+                "missing": bool(row["missing"]),
+            }
+            self._send_json(200, {"document": document})
+        except Exception:
+            self.log_error("Document retrieval failed: %s", type(Exception).__name__)
+            self._send_error(500, "Internal Server Error", "Unable to retrieve document")
 
     def log_message(self, fmt: str, *args: Any) -> None:
         # Quiet by default; errors are logged via log_error instead.
