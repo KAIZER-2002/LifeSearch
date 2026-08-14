@@ -178,6 +178,36 @@ class FeedbackStore:
             for r in rows
         ]
 
+    def get_feedback_for_documents(
+        self, document_ids: List[str]
+    ) -> Dict[str, List[Dict[str, Any]]]:
+        """Batched read of ranking signals for the given document ids.
+
+        Returns a mapping of document_id -> list of feedback records with the
+        fields the re-ranker needs (document_id, query, action, timestamp).
+        Used only for read-time personalization; never writes or alters schema.
+        """
+        if not document_ids:
+            return {}
+        placeholders = ",".join("?" for _ in document_ids)
+        sql = (
+            "SELECT document_id, query_text, action, timestamp "
+            f"FROM re_rank_feedback WHERE document_id IN ({placeholders})"
+        )
+        with self._lock:
+            rows = self._conn.execute(sql, list(document_ids)).fetchall()
+        out: Dict[str, List[Dict[str, Any]]] = {}
+        for r in rows:
+            out.setdefault(r["document_id"], []).append(
+                {
+                    "document_id": r["document_id"],
+                    "query": r["query_text"],
+                    "action": r["action"],
+                    "timestamp": r["timestamp"],
+                }
+            )
+        return out
+
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------

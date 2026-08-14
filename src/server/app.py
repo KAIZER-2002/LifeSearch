@@ -24,6 +24,7 @@ from typing import Any, Dict, Optional, Tuple
 from src.artifacts.scanner import ArtifactScanner
 from src.artifacts.store import ArtifactStore
 from src.feedback.store import FeedbackStore
+from src.feedback.rerank import apply_feedback_rerank
 from src.search.engine import SearchEngine
 from src.server.mapping import (
     build_search_response,
@@ -465,6 +466,13 @@ class SearchRequestHandler(BaseHTTPRequestHandler):
         try:
             engine = get_search_engine()
             results = engine.search(query, limit=k)
+            # Optional, fail-safe personalization: feedback re-ranking never
+            # breaks search (any failure falls back to the original results).
+            if _feedback_store is not None:
+                try:
+                    results = apply_feedback_rerank(results, _feedback_store, query)
+                except Exception as fb_exc:
+                    self.log_error("Feedback re-ranking skipped: %s", type(fb_exc).__name__)
             took_ms = int((time.time() - start) * 1000)
             response = build_search_response(results, took_ms)
             self._send_json(200, response)

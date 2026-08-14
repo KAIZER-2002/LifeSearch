@@ -946,8 +946,99 @@ class TestFeedbackUISanity:
         assert "lastQuery" in js
 
 
-if __name__ == "__main__":
-    pytest.main([__file__, "-v"])
+# ---------------------------------------------------------------------------
+# C5: Feedback re-ranking server integration tests
+# ---------------------------------------------------------------------------
+class _RaisingFeedbackStore:
+    def get_feedback_for_documents(self, document_ids):
+        raise RuntimeError('feedback store exploded')
+
+
+class TestFeedbackRerankServerIntegration:
+    '''C5 integration: feedback changes /search ranking without breaking it.'''
+
+    def setup_method(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.db_path = os.path.join(self.temp_dir.name, 'lifesearch.db')
+        self.artifact_dir = os.path.join(self.temp_dir.name, 'workspace')
+        os.makedirs(self.artifact_dir, exist_ok=True)
+        create_text_file(os.path.join(self.artifact_dir, 'notes.txt'), 'searchable content about project alpha')
+        create_text_file(os.path.join(self.artifact_dir, 'story.md'), 'a markdown story')
+        create_text_file(os.path.join(self.artifact_dir, 'todo.txt'), 'buy milk')
+        with ArtifactStore(self.db_path) as store:
+            scanner = ArtifactScanner(store, Extractor())
+            scanner.index_folder(self.artifact_dir)
+        self.port = _find_free_port()
+        self.server = LifeSearchServer(host='127.0.0.1', port=self.port)
+        self.server.start(self.db_path)
+        time.sleep(0.2)
+        self.real_feedback_store = server_app._feedback_store
+
+    def teardown_method(self):
+        if hasattr(self, 'server'):
+            try:
+                self.server.shutdown()
+            except Exception:
+                pass
+        server_app._feedback_store = getattr(self, 'real_feedback_store', None)
+        if hasattr(self, 'temp_dir'):
+            self.temp_dir.cleanup()
+
+    def _search(self, query):
+        conn = HTTPConnection('127.0.0.1', self.port, timeout=10)
+        try:
+            conn.request('POST', '/search', json.dumps({'query': query, 'k': 10}), {'Content-Type': 'application/json'})
+            resp = conn.getresponse()
+            data = resp.read().decode('utf-8')
+            return resp.status, json.loads(data)
+        finally:
+            conn.close()
+
+    def _record(self, doc_id, action, query):
+        conn = HTTPConnection('127.0.0.1', self.port, timeout=10)
+        try:
+            conn.request('POST', '/feedback', json.dumps({'query': query, 'document_id': str(doc_id), 'action': action}), {'Content-Type': 'application/json'})
+            return conn.getresponse().status
+        finally:
+            conn.close()
+
+    def _doc_id(self, filename):
+        engine = server_app.get_search_engine()
+        store = engine.artifact_store
+        row = store.get_artifact_by_path(os.path.abspath(os.path.join(self.artifact_dir, filename)))
+        return int(row['id'])
+
+    def test_feedback_failure_does_not_500(self):
+        server_app._feedback_store = _RaisingFeedbackStore()
+        try:
+            status, _ = self._search('searchable content about project alpha')
+            assert status == 200
+        finally:
+            server_app._feedback_store = self.real_feedback_store
+
+    def test_matching_feedback_boosts_score(self):
+        doc_id = self._doc_id('notes.txt')
+        q = 'searchable content about project alpha'
+        _, data1 = self._search(q)
+        base = {r['document_id']: r['score'] for r in data1['results']}[str(doc_id)]
+        assert self._record(doc_id, 'pin', q) == 200
+        _, data2 = self._search(q)
+        after = {r['document_id']: r['score'] for r in data2['results']}[str(doc_id)]
+        assert after > base
+
+    def test_unrelated_feedback_no_change(self):
+        doc_id = self._doc_id('notes.txt')
+        q = 'searchable content about project alpha'
+        _, data1 = self._search(q)
+        base = {r['document_id']: r['score'] for r in data1['results']}[str(doc_id)]
+        assert self._record(doc_id, 'pin', 'zzz unrelated query words here') == 200
+        _, data2 = self._search(q)
+        after = {r['document_id']: r['score'] for r in data2['results']}[str(doc_id)]
+        assert abs(after - base) < 1e-6
+
+
+if __name__ == '__main__':
+    pytest.main([__file__, '-v'])
 
 
 # ---------------------------------------------------------------------------
