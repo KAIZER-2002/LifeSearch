@@ -344,6 +344,34 @@ body {
   outline-offset: 2px;
 }
 
+.feedback-button {
+  background: transparent;
+  border: 1px solid var(--border-strong);
+  color: var(--text-dim);
+  padding: 8px 14px;
+  border-radius: 8px;
+  cursor: pointer;
+  font-size: 13px;
+}
+.feedback-button:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+.feedback-button:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+.feedback-button:disabled {
+  opacity: 0.55;
+  cursor: default;
+  border-color: var(--border);
+  color: var(--text-faint);
+}
+.feedback-status {
+  min-height: 18px;
+  margin: 10px 2px 0;
+}
+
 /* Modal */
 .modal {
   position: fixed;

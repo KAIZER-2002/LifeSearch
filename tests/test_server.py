@@ -690,6 +690,262 @@ class TestIndexingUISanity:
         assert "indexError" in js or "showIndexError" in js
 
 
+# ---------------------------------------------------------------------------
+# Phase C4: Search feedback capture & ranking signal endpoint tests
+# ---------------------------------------------------------------------------
+from src.feedback.store import FeedbackStore
+
+
+class _FakeFailingFeedbackStore:
+    """FeedbackStore whose record() always raises (secret-free message)."""
+
+    def record(self, query, document_id, action):
+        raise RuntimeError("SECRET_DB_PATH_/tmp/leak details should not surface")
+
+    def close(self):
+        pass
+
+
+class TestFeedbackStore:
+    """Unit tests for the isolated FeedbackStore (no server)."""
+
+    def setup_method(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.db_path = os.path.join(self.temp_dir.name, "feedback.db")
+        self.store = FeedbackStore(self.db_path)
+
+    def teardown_method(self):
+        try:
+            self.store.close()
+        except Exception:
+            pass
+        self.temp_dir.cleanup()
+
+    def test_record_and_read_click(self):
+        self.store.record("find qdrant pdf", "42", "click")
+        rows = self.store.get_feedback(document_id="42")
+        assert len(rows) == 1
+        row = rows[0]
+        assert row["action"] == "click"
+        assert row["query"] == "find qdrant pdf"
+        assert row["document_id"] == "42"
+        assert isinstance(row["timestamp"], int)
+
+    def test_record_ignore(self):
+        self.store.record("q", "1", "ignore")
+        rows = self.store.get_feedback(document_id="1")
+        assert len(rows) == 1
+        assert rows[0]["action"] == "ignore"
+
+    def test_record_pin(self):
+        self.store.record("q", "2", "pin")
+        rows = self.store.get_feedback(document_id="2")
+        assert len(rows) == 1
+        assert rows[0]["action"] == "pin"
+
+    def test_read_back_multiple(self):
+        for i in range(3):
+            self.store.record("q", str(i), "click")
+        assert len(self.store.get_feedback()) == 3
+
+    def test_invalid_action_rejected(self):
+        with pytest.raises(ValueError):
+            self.store.record("q", "1", "explode")
+
+    def test_get_counts(self):
+        self.store.record("q", "1", "click")
+        self.store.record("q", "1", "pin")
+        counts = self.store.get_counts(document_id="1")
+        assert counts.get("click") == 1
+        assert counts.get("pin") == 1
+
+
+class TestFeedbackAPI:
+    """Integration tests for POST /feedback (Phase C4)."""
+
+    def setup_method(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.db_path = os.path.join(self.temp_dir.name, "lifesearch.db")
+        self.artifact_dir = os.path.join(self.temp_dir.name, "workspace")
+        os.makedirs(self.artifact_dir, exist_ok=True)
+
+        create_text_file(os.path.join(self.artifact_dir, "notes.txt"), "searchable content about project")
+        create_text_file(os.path.join(self.artifact_dir, "story.md"), "a markdown story about life")
+        create_text_file(os.path.join(self.artifact_dir, "todo.txt"), "buy milk and eggs")
+
+        with ArtifactStore(self.db_path) as store:
+            scanner = ArtifactScanner(store, Extractor())
+            scanner.index_folder(self.artifact_dir)
+
+        self.port = _find_free_port()
+        self.server = LifeSearchServer(host="127.0.0.1", port=self.port)
+        self.server.start(self.db_path)
+        time.sleep(0.2)
+        # Capture the real feedback store so tests can inject a fake safely.
+        self.real_feedback_store = server_app._feedback_store
+
+    def teardown_method(self):
+        if hasattr(self, "server"):
+            try:
+                self.server.shutdown()
+            except Exception:
+                pass
+        server_app._feedback_store = getattr(self, "real_feedback_store", None)
+        if hasattr(self, "temp_dir"):
+            self.temp_dir.cleanup()
+
+    def _make_request(self, method, path, body=None):
+        conn = HTTPConnection("127.0.0.1", self.port, timeout=10)
+        headers = {"Content-Type": "application/json"} if body is not None else {}
+        try:
+            if body is not None:
+                conn.request(method, path, json.dumps(body), headers)
+            else:
+                conn.request(method, path)
+            response = conn.getresponse()
+            data = response.read().decode("utf-8")
+            return response.status, data
+        finally:
+            conn.close()
+
+    def _post_feedback(self, payload):
+        return self._make_request("POST", "/feedback", payload)
+
+    def test_valid_click_returns_200(self):
+        status, data = self._post_feedback({"query": "x", "document_id": "5", "action": "click"})
+        assert status == 200
+        assert json.loads(data)["ok"] is True
+
+    def test_valid_ignore_returns_200(self):
+        status, data = self._post_feedback({"query": "x", "document_id": "5", "action": "ignore"})
+        assert status == 200
+        assert json.loads(data)["ok"] is True
+
+    def test_valid_pin_returns_200(self):
+        status, data = self._post_feedback({"query": "x", "document_id": "5", "action": "pin"})
+        assert status == 200
+        assert json.loads(data)["ok"] is True
+
+    def test_missing_query_returns_400(self):
+        status, _ = self._post_feedback({"document_id": "5", "action": "click"})
+        assert status == 400
+
+    def test_missing_document_id_returns_400(self):
+        status, _ = self._post_feedback({"query": "x", "action": "click"})
+        assert status == 400
+
+    def test_missing_action_returns_400(self):
+        status, _ = self._post_feedback({"query": "x", "document_id": "5"})
+        assert status == 400
+
+    def test_invalid_action_returns_400(self):
+        status, _ = self._post_feedback({"query": "x", "document_id": "5", "action": "explode"})
+        assert status == 400
+
+    def test_malformed_json_returns_400(self):
+        conn = HTTPConnection("127.0.0.1", self.port, timeout=10)
+        conn.request("POST", "/feedback", "not valid json", {"Content-Type": "application/json"})
+        response = conn.getresponse()
+        data = response.read().decode("utf-8")
+        conn.close()
+        assert response.status == 400
+        assert "traceback" not in data.lower()
+
+    def test_wrong_field_types_returns_400(self):
+        # query must be a string
+        status, _ = self._post_feedback({"query": 123, "document_id": "5", "action": "click"})
+        assert status == 400
+        # action must be a string
+        status, _ = self._post_feedback({"query": "x", "document_id": "5", "action": 7})
+        assert status == 400
+
+    def test_internal_failure_safe_500(self):
+        server_app._feedback_store = _FakeFailingFeedbackStore()
+        try:
+            status, data = self._post_feedback({"query": "x", "document_id": "5", "action": "click"})
+            assert status == 500
+            body = json.loads(data)
+            assert body["error"]["code"] == 500
+            # No internal detail leakage.
+            assert "SECRET_DB_PATH" not in data
+            assert "traceback" not in data.lower()
+            assert self.db_path not in data
+        finally:
+            server_app._feedback_store = self.real_feedback_store
+
+    def test_concurrent_feedback_no_avoidable_500(self):
+        errors = []
+        lock = threading.Lock()
+
+        def worker():
+            status, _ = self._post_feedback({"query": "q", "document_id": "9", "action": "click"})
+            with lock:
+                errors.append(status)
+
+        threads = [threading.Thread(target=worker) for _ in range(10)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=5)
+
+        assert errors, "no requests were made"
+        assert all(s == 200 for s in errors), errors
+
+    def test_regression_other_endpoints_still_work(self):
+        # /search
+        status, data = self._make_request("POST", "/search", {"query": "searchable", "k": 10})
+        assert status == 200
+        assert len(json.loads(data)["results"]) >= 1
+        # /status
+        status, _ = self._make_request("GET", "/status")
+        assert status == 200
+        # /index/status (no job running)
+        status, data = self._make_request("GET", "/index/status")
+        assert status == 200
+        assert json.loads(data)["indexing_in_progress"] is False
+        # /document
+        engine = server_app.get_search_engine()
+        store = getattr(engine, "artifact_store", None)
+        row = store.get_artifact_by_path(
+            os.path.abspath(os.path.join(self.artifact_dir, "notes.txt"))
+        )
+        doc_id = int(row["id"])
+        status, _ = self._make_request("GET", "/document/" + str(doc_id))
+        assert status == 200
+
+
+class TestFeedbackUISanity:
+    """Phase C4 UI: front-end must drive the /feedback endpoint.
+
+    No browser automation; inspects the served static files on disk.
+    """
+
+    def _read(self, name):
+        with open(os.path.join(STATIC_DIR, name), "r", encoding="utf-8") as fh:
+            return fh.read()
+
+    def test_index_html_has_feedback_status(self):
+        html = self._read("index.html")
+        assert 'id="feedback-status"' in html
+
+    def test_app_js_references_feedback_endpoint(self):
+        js = self._read("app.js")
+        assert '"/feedback"' in js or "'/feedback'" in js
+
+    def test_app_js_feedback_actions_represented(self):
+        js = self._read("app.js")
+        assert "pin" in js
+        assert "ignore" in js
+        assert "click" in js
+
+    def test_app_js_feedback_includes_active_query(self):
+        js = self._read("app.js")
+        # The feedback request must carry the active query and document id.
+        assert "query: query" in js
+        assert "document_id:" in js
+        assert "lastQuery" in js
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
 

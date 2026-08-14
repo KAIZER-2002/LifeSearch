@@ -116,6 +116,16 @@
     var detailBtn = docId
       ? '<button type="button" class="detail-button" data-doc-id="' + docId + '">View details</button>'
       : "";
+    var pinBtn = docId
+      ? '<button type="button" class="feedback-button pin-button" data-doc-id="' + docId + '" data-action="pin">Pin</button>'
+      : "";
+    var ignoreBtn = docId
+      ? '<button type="button" class="feedback-button ignore-button" data-doc-id="' + docId + '" data-action="ignore">Not relevant</button>'
+      : "";
+
+    var actions = (detailBtn || pinBtn || ignoreBtn)
+      ? '<div class="card-actions">' + detailBtn + pinBtn + ignoreBtn + "</div>"
+      : "";
 
     return (
       '<article class="result-card" data-doc-id="' + docId + '">' +
@@ -131,7 +141,7 @@
         '<details class="card-path"><summary>File location</summary>' +
           '<p class="path-text">' + path + "</p>" +
         "</details>" +
-        (detailBtn ? '<div class="card-actions">' + detailBtn + "</div>" : "") +
+        actions +
       "</article>"
     );
   }
@@ -207,13 +217,70 @@
     runSearch(q);
   });
 
-  // Event delegation for "View details" buttons.
+  // Event delegation for "View details" and feedback buttons.
   resultsEl.addEventListener("click", function (e) {
+    var fb = e.target.closest(".feedback-button");
+    if (fb) {
+      var fbId = fb.getAttribute("data-doc-id");
+      var action = fb.getAttribute("data-action");
+      if (fbId && action) sendFeedback(fbId, action, fb);
+      return;
+    }
     var btn = e.target.closest(".detail-button");
     if (!btn) return;
     var id = btn.getAttribute("data-doc-id");
     if (id) openDocument(id, btn);
   });
+
+  var feedbackStatus = document.getElementById("feedback-status");
+  var feedbackStatusTimer = null;
+
+  function showFeedbackConfirmation(message) {
+    if (!feedbackStatus) return;
+    feedbackStatus.textContent = message;
+    feedbackStatus.hidden = false;
+    if (feedbackStatusTimer) clearTimeout(feedbackStatusTimer);
+    feedbackStatusTimer = setTimeout(function () {
+      feedbackStatus.hidden = true;
+    }, 1500);
+  }
+
+  function sendFeedback(docId, action, btn) {
+    if (!docId) return;
+    var query = lastQuery || "";
+    fetch("/feedback", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ query: query, document_id: String(docId), action: action }),
+    })
+      .then(function (resp) {
+        return resp.json().then(function (d) {
+          return { ok: resp.ok, data: d };
+        }, function () {
+          return { ok: resp.ok, data: null };
+        });
+      })
+      .then(function (out) {
+        if (out.ok && out.data && out.data.ok) {
+          if (btn) {
+            if (action === "pin") {
+              btn.textContent = "Pinned";
+              btn.disabled = true;
+            } else if (action === "ignore") {
+              btn.textContent = "Noted";
+              btn.disabled = true;
+            }
+          }
+          showFeedbackConfirmation(
+            action === "pin" ? "Pinned — thanks for the signal." : "Thanks for the feedback."
+          );
+        }
+        // On failure, do nothing visible; feedback must never break search/open.
+      })
+      .catch(function () {
+        // Network errors are ignored; the core UX remains fully functional.
+      });
+  }
 
   function openDocument(id, btn) {
     btn.disabled = true;
@@ -232,6 +299,8 @@
         }
         renderDocument(out.data.document);
         openModal();
+        // Opening a result is itself a positive signal.
+        sendFeedback(id, "click", null);
       })
       .catch(function () {
         showDocError("Could not load document details.");

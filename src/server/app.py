@@ -22,6 +22,8 @@ from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from typing import Any, Dict, Optional, Tuple
 
 from src.artifacts.scanner import ArtifactScanner
+from src.artifacts.store import ArtifactStore
+from src.feedback.store import FeedbackStore
 from src.search.engine import SearchEngine
 from src.server.mapping import (
     build_search_response,
@@ -104,6 +106,22 @@ _index_job_lock = threading.Lock()
 _rw_lock = _ReadWriteLock()
 # The scanner from build_stack (shares the same stores as the SearchEngine).
 _artifact_scanner: Optional[ArtifactScanner] = None
+
+# Feedback signal store (Phase C4). Isolated from the search/artifact stores;
+# opens its own connection to the same database file.
+_feedback_store: Optional[FeedbackStore] = None
+
+
+def _close_feedback_store() -> None:
+    """Close the feedback store connection cleanly (idempotent)."""
+    global _feedback_store
+    store = _feedback_store
+    _feedback_store = None
+    if store is not None:
+        try:
+            store.close()
+        except Exception:
+            pass
 
 
 def _safe_index_error(exc: Exception) -> str:
@@ -215,7 +233,7 @@ def init_stack(db_path: Optional[str] = None) -> None:
     delegates to ``build_stack`` so the server shares the exact same wiring
     as the CLI commands.
     """
-    global _search_engine, _artifact_scanner, _index_thread
+    global _search_engine, _artifact_scanner, _index_thread, _feedback_store
 
     # Release any previously-initialized handles to avoid leaking file
     # descriptors between in-process server restarts (e.g. across tests).
@@ -238,10 +256,16 @@ def init_stack(db_path: Optional[str] = None) -> None:
     # exactly what /search reads.
     _, _artifact_scanner, _search_engine = build_stack(db_path)
 
+    # The feedback store shares the same on-disk database as the rest of the
+    # stack (same resolution rule as build_stack) but owns its own connection.
+    resolved = db_path or ArtifactStore.default_db_path()
+    _feedback_store = FeedbackStore(resolved)
+
 
 def _close_current_stack() -> None:
-    global _search_engine, _artifact_scanner
+    global _search_engine, _artifact_scanner, _feedback_store
     _artifact_scanner = None
+    _close_feedback_store()
     engine = _search_engine
     if engine is None:
         return
@@ -258,6 +282,12 @@ def get_search_engine() -> SearchEngine:
     if _search_engine is None:
         raise RuntimeError("Search engine not initialized. Call init_stack() first.")
     return _search_engine
+
+
+def get_feedback_store() -> FeedbackStore:
+    if _feedback_store is None:
+        raise RuntimeError("Feedback store not initialized. Call init_stack() first.")
+    return _feedback_store
 
 
 def get_status_info() -> Dict[str, Any]:
@@ -394,6 +424,8 @@ class SearchRequestHandler(BaseHTTPRequestHandler):
             self._handle_search()
         elif parsed == "/index":
             self._handle_index()
+        elif parsed == "/feedback":
+            self._handle_feedback()
         else:
             self._send_error(404, "Not Found", f"POST {parsed} not found")
 
@@ -572,6 +604,45 @@ class SearchRequestHandler(BaseHTTPRequestHandler):
             status = dict(_index_state)
         self._send_json(200, status)
 
+    # ---- feedback (Phase C4) -----------------------------------------------
+
+    def _handle_feedback(self) -> None:
+        """POST /feedback: capture a user ranking signal (click/ignore/pin)."""
+        data, error = self._read_json_body()
+        if error:
+            self._send_error(400, "Bad Request", error)
+            return
+
+        query = data.get("query")
+        document_id = data.get("document_id")
+        action = data.get("action")
+
+        # Type/shape validation -> 400 (never 500 for bad client input).
+        if not isinstance(query, str) or not query.strip():
+            self._send_error(400, "Bad Request", "query must be a non-empty string")
+            return
+        if not isinstance(document_id, str) or not document_id.strip():
+            self._send_error(400, "Bad Request", "document_id must be a non-empty string")
+            return
+        if not isinstance(action, str):
+            self._send_error(400, "Bad Request", "action must be a string")
+            return
+
+        try:
+            store = get_feedback_store()
+            store.record(query.strip(), document_id.strip(), action)
+        except ValueError:
+            # Invalid action value (e.g. not in click/ignore/pin).
+            self._send_error(400, "Bad Request", "action must be one of: click, ignore, pin")
+            return
+        except Exception as exc:
+            # Log server-side only; never expose internals to the client.
+            self.log_error("Feedback recording failed: %s", type(exc).__name__)
+            self._send_error(500, "Internal Server Error", "Feedback could not be recorded")
+            return
+
+        self._send_json(200, {"ok": True})
+
     def _handle_static(self, parsed_path: str) -> None:
         asset = _resolve_static_asset(parsed_path)
         if asset is None:
@@ -672,6 +743,8 @@ class LifeSearchServer:
         # Wait for the indexing worker to finish cleanly; we never forcibly
         # kill the thread. If it is still running, join it (bounded wait).
         _join_index_worker(timeout=30.0)
+        # Close the feedback store connection cleanly on shutdown.
+        _close_feedback_store()
         self._shutdown_event.set()
 
     def wait_for_shutdown(self) -> None:
@@ -684,7 +757,7 @@ def serve(host: str = "127.0.0.1", port: int = 30013, db_path: Optional[str] = N
     try:
         server.start(db_path)
         print(f"Life Search server running on http://{host}:{port}")
-        print("Endpoints: POST /search, GET /status")
+        print("Endpoints: POST /search, POST /feedback, GET /status")
         server.wait_for_shutdown()
     except KeyboardInterrupt:
         print("\nShutting down...")
