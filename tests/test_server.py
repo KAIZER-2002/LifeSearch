@@ -639,6 +639,57 @@ class TestFrontendSanity:
             assert 'url(http' not in content
 
 
+class TestIndexingUISanity:
+    """Phase C UI: the browser front-end must drive the C2 indexing API.
+
+    No browser automation; inspects the served static files on disk.
+    """
+
+    def _read(self, name):
+        with open(os.path.join(STATIC_DIR, name), "r", encoding="utf-8") as fh:
+            return fh.read()
+
+    def test_index_html_has_indexing_panel(self):
+        html = self._read("index.html")
+        for needed in (
+            'id="index-section"',
+            'id="index-form"',
+            'id="index-path"',
+            'id="index-reindex"',
+            'id="index-button"',
+            'id="index-status"',
+            'id="index-progress-bar"',
+            'id="index-processed"',
+            'id="index-skipped"',
+            'id="index-errors"',
+            'id="index-current-folder"',
+            'id="index-error"',
+        ):
+            assert needed in html, needed
+
+    def test_index_html_no_external_network_urls(self):
+        html = self._read("index.html")
+        assert "http://" not in html
+        assert "https://" not in html
+        assert "cdn." not in html
+
+    def test_app_js_references_index_endpoints(self):
+        js = self._read("app.js")
+        assert '"/index"' in js or "'/index'" in js
+        assert '"/index/status"' in js or "'/index/status'" in js
+
+    def test_app_js_implements_indexing_flow(self):
+        js = self._read("app.js")
+        # Drives the API: schedules indexing, polls status, renders progress.
+        assert "indexing_in_progress" in js
+        assert "progress_percent" in js
+        assert "last_indexed_ms" in js
+        # Re-index flag is forwarded to the backend.
+        assert "reindex" in js
+        # Friendly error handling on failure.
+        assert "indexError" in js or "showIndexError" in js
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
 

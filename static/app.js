@@ -292,4 +292,188 @@
 
   // Initial state.
   showState("empty");
+
+  // -------------------------------------------------------------------------
+  // Indexing panel (Phase C): on-demand folder indexing + status/progress.
+  // -------------------------------------------------------------------------
+  var indexForm = document.getElementById("index-form");
+  var indexPath = document.getElementById("index-path");
+  var indexReindex = document.getElementById("index-reindex");
+  var indexButton = document.getElementById("index-button");
+  var indexStatus = document.getElementById("index-status");
+  var indexStateLabel = document.getElementById("index-state-label");
+  var indexLastIndexed = document.getElementById("index-last-indexed");
+  var indexProgress = document.getElementById("index-progress");
+  var indexProgressBar = document.getElementById("index-progress-bar");
+  var indexProgressText = document.getElementById("index-progress-text");
+  var indexProcessed = document.getElementById("index-processed");
+  var indexSkipped = document.getElementById("index-skipped");
+  var indexErrors = document.getElementById("index-errors");
+  var indexCurrentFolder = document.getElementById("index-current-folder");
+  var indexError = document.getElementById("index-error");
+
+  var indexPollTimer = null;
+
+  function showIndexError(msg) {
+    indexError.textContent = msg;
+    indexError.hidden = false;
+  }
+
+  function clearIndexError() {
+    indexError.textContent = "";
+    indexError.hidden = true;
+  }
+
+  function formatDateTime(ms) {
+    if (ms === null || ms === undefined || ms === 0) return "";
+    try {
+      var d = new Date(ms);
+      if (isNaN(d.getTime())) return "";
+      return d.toLocaleString();
+    } catch (e) {
+      return "";
+    }
+  }
+
+  function startIndexPolling() {
+    if (indexPollTimer) clearInterval(indexPollTimer);
+    indexPollTimer = setInterval(fetchIndexStatus, 1000);
+    fetchIndexStatus();
+  }
+
+  function stopIndexPolling() {
+    if (indexPollTimer) {
+      clearInterval(indexPollTimer);
+      indexPollTimer = null;
+    }
+  }
+
+  function renderIndexStatus(s) {
+    if (!s) return;
+    var inProgress = !!s.indexing_in_progress;
+    if (inProgress) {
+      indexStateLabel.textContent = "Indexing…";
+    } else if (s.last_error) {
+      indexStateLabel.textContent = "Finished with errors";
+    } else {
+      indexStateLabel.textContent = "Idle";
+    }
+
+    var pct = typeof s.progress_percent === "number" ? s.progress_percent : 0;
+    indexProgressBar.style.width = pct + "%";
+    if (indexProgress) indexProgress.setAttribute("aria-valuenow", String(pct));
+    indexProgressText.textContent = "Progress: " + pct + "%";
+
+    indexProcessed.textContent = s.processed != null ? s.processed : 0;
+    indexSkipped.textContent = s.skipped != null ? s.skipped : 0;
+    indexErrors.textContent = s.errors != null ? s.errors : 0;
+
+    indexCurrentFolder.textContent = s.current_folder
+      ? "Current folder: " + s.current_folder
+      : "";
+
+    indexLastIndexed.textContent = s.last_indexed_ms
+      ? "Last indexed: " + formatDateTime(s.last_indexed_ms)
+      : "";
+
+    if (s.last_error) {
+      showIndexError("Last indexing failed: " + s.last_error);
+    } else if (!inProgress) {
+      clearIndexError();
+    }
+  }
+
+  function fetchIndexStatus() {
+    fetch("/index/status")
+      .then(function (resp) {
+        return resp.json().then(function (d) { return d; }, function () { return null; });
+      })
+      .then(function (status) {
+        if (!status) return;
+        renderIndexStatus(status);
+        if (!status.indexing_in_progress) {
+          stopIndexPolling();
+          indexButton.disabled = false;
+        }
+      })
+      .catch(function () {
+        // Transient; the next poll will retry. Do not spam errors.
+      });
+  }
+
+  function runIndex() {
+    var raw = indexPath.value.trim();
+    if (!raw) {
+      showIndexError("Enter at least one absolute folder path to index.");
+      return;
+    }
+    // Accept multiple paths: one per line, or comma/semicolon separated.
+    var paths = raw.split(/[\n,;]+/).map(function (p) { return p.trim(); }).filter(Boolean);
+    if (paths.length === 0) {
+      showIndexError("Enter at least one absolute folder path to index.");
+      return;
+    }
+    var reindex = !!indexReindex.checked;
+
+    indexButton.disabled = true;
+    clearIndexError();
+
+    fetch("/index", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ paths: paths, reindex: reindex }),
+    })
+      .then(function (resp) {
+        return resp.json().then(function (data) {
+          return { ok: resp.ok, status: resp.status, data: data };
+        }, function () {
+          return { ok: resp.ok, status: resp.status, data: null };
+        });
+      })
+      .then(function (out) {
+        if (out.ok && out.status === 202) {
+          // Scheduled. Show progress and begin polling status.
+          indexStateLabel.textContent = "Indexing…";
+          startIndexPolling();
+          return;
+        }
+        var msg =
+          out.data && out.data.error && out.data.error.message
+            ? out.data.error.message
+            : "Could not start indexing.";
+        var detail =
+          out.data && out.data.error && out.data.error.detail
+            ? out.data.error.detail
+            : "";
+        showIndexError(detail ? msg + ": " + detail : msg);
+        indexButton.disabled = false;
+      })
+      .catch(function () {
+        showIndexError(
+          "We couldn’t reach the indexing service. Please make sure LifeSearch is running."
+        );
+        indexButton.disabled = false;
+      });
+  }
+
+  if (indexForm) {
+    indexForm.addEventListener("submit", function (e) {
+      e.preventDefault();
+      runIndex();
+    });
+  }
+
+  // Reflect any already-running/in-progress job on load.
+  if (indexStatus) {
+    fetch("/index/status")
+      .then(function (resp) {
+        return resp.json().then(function (d) { return d; }, function () { return null; });
+      })
+      .then(function (s) {
+        if (!s) return;
+        renderIndexStatus(s);
+        if (s.indexing_in_progress) startIndexPolling();
+      })
+      .catch(function () {});
+  }
 })();

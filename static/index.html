@@ -37,6 +37,49 @@
       <p id="status-line" class="status-line" role="status" aria-live="polite"></p>
     </section>
 
+    <section id="index-section" class="index-section" aria-label="Index folders">
+      <h2 class="section-heading">Index a folder</h2>
+      <p class="section-hint">
+        Add a folder by its absolute path to index it on demand. Indexing runs in the
+        background; you can keep searching while it works.
+      </p>
+      <form id="index-form" class="index-form" aria-label="Index a folder">
+        <label for="index-path" class="visually-hidden">Folder path to index (absolute)</label>
+        <textarea
+          id="index-path"
+          name="paths"
+          class="index-path-input"
+          rows="2"
+          placeholder="Absolute folder path, e.g. /home/you/Documents (one per line)"
+        ></textarea>
+        <div class="index-options">
+          <label class="checkbox-label">
+            <input type="checkbox" id="index-reindex" />
+            Re-index everything (ignore previously indexed files)
+          </label>
+        </div>
+        <button type="submit" id="index-button" class="index-button">Index folder</button>
+      </form>
+
+      <div id="index-status" class="index-status" aria-live="polite">
+        <div class="index-status-row">
+          <span id="index-state-label" class="index-state-label">Idle</span>
+          <span id="index-last-indexed" class="index-last-indexed"></span>
+        </div>
+        <div class="progress" id="index-progress" role="progressbar" aria-valuemin="0" aria-valuemax="100">
+          <div id="index-progress-bar" class="progress-bar"></div>
+        </div>
+        <p id="index-progress-text" class="index-progress-text"></p>
+        <div class="index-counts">
+          <span class="count count-processed">Processed: <b id="index-processed">0</b></span>
+          <span class="count count-skipped">Skipped: <b id="index-skipped">0</b></span>
+          <span class="count count-errors">Errors: <b id="index-errors">0</b></span>
+        </div>
+        <p id="index-current-folder" class="index-current-folder"></p>
+        <p id="index-error" class="index-error" hidden></p>
+      </div>
+    </section>
+
     <section id="results" class="results" aria-label="Search results" hidden></section>
 
     <div id="empty-state" class="state empty-state">
