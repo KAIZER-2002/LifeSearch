@@ -21,12 +21,140 @@ import time
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from typing import Any, Dict, Optional, Tuple
 
+from src.artifacts.scanner import ArtifactScanner
 from src.search.engine import SearchEngine
 from src.server.mapping import (
     build_search_response,
     build_status_response,
     build_error_response,
 )
+
+
+# ---------------------------------------------------------------------------
+# Minimal reader/writer lock
+# ---------------------------------------------------------------------------
+# Indexing mutates the shared VectorStore/HNSW + ArtifactStore state, while
+# search reads it. We serialize the two at the server coordination layer with
+# a reader/writer lock: many concurrent searches (readers) are allowed, but an
+# indexing job (writer) is exclusive. This keeps search responsive while
+# guaranteeing the HNSW index is never mutated mid-search.
+class _ReadWriteLock:
+    def __init__(self) -> None:
+        self._cond = threading.Condition(threading.Lock())
+        self._readers = 0
+        self._writer = False
+
+    def acquire_read(self, timeout: Optional[float] = None) -> bool:
+        with self._cond:
+            deadline = None if timeout is None else time.time() + timeout
+            while self._writer:
+                remaining = None if deadline is None else max(0.0, deadline - time.time())
+                if remaining == 0:
+                    return False
+                if not self._cond.wait(remaining):
+                    return False
+            self._readers += 1
+        return True
+
+    def release_read(self) -> None:
+        with self._cond:
+            self._readers = max(0, self._readers - 1)
+            if self._readers == 0:
+                self._cond.notify_all()
+
+    def acquire_write(self, timeout: Optional[float] = None) -> bool:
+        with self._cond:
+            deadline = None if timeout is None else time.time() + timeout
+            while self._writer or self._readers > 0:
+                remaining = None if deadline is None else max(0.0, deadline - time.time())
+                if remaining == 0:
+                    return False
+                if not self._cond.wait(remaining):
+                    return False
+            self._writer = True
+        return True
+
+    def release_write(self) -> None:
+        with self._cond:
+            self._writer = False
+            self._cond.notify_all()
+
+
+# ---------------------------------------------------------------------------
+# Indexing worker coordination (Phase C)
+# ---------------------------------------------------------------------------
+# Exactly ONE indexing worker thread may exist at a time. The HTTP handler
+# validates input and schedules the job; the worker runs index_folder() off
+# the request thread so the handler returns immediately (HTTP 202).
+_index_state: Dict[str, Any] = {
+    "indexing_in_progress": False,
+    "progress_percent": 0,
+    "processed": 0,
+    "skipped": 0,
+    "errors": 0,
+    "current_folder": None,
+    "last_indexed_ms": None,
+    "last_error": None,
+}
+_index_thread: Optional[threading.Thread] = None
+# Guards _index_state and the "is a job running?" transition. Smallest safe
+# scope: protects status reads/writes and duplicate-job detection only.
+_index_job_lock = threading.Lock()
+# Search/index serialization (see _ReadWriteLock above).
+_rw_lock = _ReadWriteLock()
+# The scanner from build_stack (shares the same stores as the SearchEngine).
+_artifact_scanner: Optional[ArtifactScanner] = None
+
+
+def _safe_index_error(exc: Exception) -> str:
+    """Return a concise, client-safe error message.
+
+    Never includes file paths, tracebacks, database paths, secrets, or file
+    contents -- only the exception type, which is safe to surface.
+    """
+    return f"Indexing failed ({type(exc).__name__})."
+
+
+def _join_index_worker(timeout: Optional[float] = None) -> None:
+    """Wait for the indexing worker to finish; never kill the thread."""
+    thread = _index_thread
+    if thread is not None and thread.is_alive():
+        thread.join(timeout)
+
+
+def _reset_index_state_locked() -> None:
+    _index_state.update(
+        {
+            "indexing_in_progress": True,
+            "progress_percent": 0,
+            "processed": 0,
+            "skipped": 0,
+            "errors": 0,
+            "current_folder": None,
+            "last_error": None,
+        }
+    )
+
+
+def _reset_index_state_full() -> None:
+    """Reset status to a fresh, idle session (called when the stack starts).
+
+    Clears last_indexed_ms too, so a freshly initialized server reports a
+    null last-indexed time until its first successful job.
+    """
+    with _index_job_lock:
+        _index_state.update(
+            {
+                "indexing_in_progress": False,
+                "progress_percent": 0,
+                "processed": 0,
+                "skipped": 0,
+                "errors": 0,
+                "current_folder": None,
+                "last_indexed_ms": None,
+                "last_error": None,
+            }
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -87,20 +215,33 @@ def init_stack(db_path: Optional[str] = None) -> None:
     delegates to ``build_stack`` so the server shares the exact same wiring
     as the CLI commands.
     """
-    global _search_engine
+    global _search_engine, _artifact_scanner, _index_thread
 
     # Release any previously-initialized handles to avoid leaking file
     # descriptors between in-process server restarts (e.g. across tests).
     _close_current_stack()
 
+    # Drop any stale finished indexing worker so duplicate-job detection does
+    # not mistakenly treat a dead thread as still running across restarts.
+    if _index_thread is not None and not _index_thread.is_alive():
+        _index_thread = None
+
+    # Start each server session with a clean indexing status.
+    _reset_index_state_full()
+
     # Imported lazily to avoid a circular import at module-load time:
     # src.cli.main imports this module for command_serve.
     from src.cli.main import build_stack
 
-    _, _, _search_engine = build_stack(db_path)
+    # build_stack returns (store, scanner, search_engine); reuse the very same
+    # scanner that shares the SearchEngine's stores so indexing populates
+    # exactly what /search reads.
+    _, _artifact_scanner, _search_engine = build_stack(db_path)
 
 
 def _close_current_stack() -> None:
+    global _search_engine, _artifact_scanner
+    _artifact_scanner = None
     engine = _search_engine
     if engine is None:
         return
@@ -251,6 +392,8 @@ class SearchRequestHandler(BaseHTTPRequestHandler):
         parsed = self.path.split("?", 1)[0]
         if parsed == "/search":
             self._handle_search()
+        elif parsed == "/index":
+            self._handle_index()
         else:
             self._send_error(404, "Not Found", f"POST {parsed} not found")
 
@@ -258,6 +401,8 @@ class SearchRequestHandler(BaseHTTPRequestHandler):
         parsed = self.path.split("?", 1)[0]
         if parsed == "/status":
             self._handle_status()
+        elif parsed == "/index/status":
+            self._handle_index_status()
         elif parsed.startswith("/document/"):
             self._handle_document(parsed)
         else:
@@ -278,6 +423,13 @@ class SearchRequestHandler(BaseHTTPRequestHandler):
             self._send_error(400, "Bad Request", error)
             return
 
+        # Coordinate with indexing: a running index job holds the write lock,
+        # so search waits for it to finish rather than reading a half-built
+        # HNSW index. Multiple searches share the read lock concurrently.
+        if not _rw_lock.acquire_read(timeout=30.0):
+            self._send_error(503, "Service Unavailable", "Search temporarily unavailable")
+            return
+
         try:
             engine = get_search_engine()
             results = engine.search(query, limit=k)
@@ -288,6 +440,8 @@ class SearchRequestHandler(BaseHTTPRequestHandler):
             # Log server-side only; never expose internals to the client.
             self.log_error("Search failed: %s", type(exc).__name__)
             self._send_error(500, "Internal Server Error", "Search failed")
+        finally:
+            _rw_lock.release_read()
 
     def _handle_status(self) -> None:
         try:
@@ -296,6 +450,127 @@ class SearchRequestHandler(BaseHTTPRequestHandler):
             self._send_json(200, response)
         except Exception:
             self._send_error(500, "Internal Server Error", "Status unavailable")
+
+    # ---- indexing (Phase C) ------------------------------------------------
+
+    def _handle_index(self) -> None:
+        """POST /index: validate input and schedule an indexing job (202)."""
+        data, error = self._read_json_body()
+        if error:
+            self._send_error(400, "Bad Request", error)
+            return
+
+        paths = data.get("paths")
+        if not isinstance(paths, list) or not paths:
+            self._send_error(400, "Bad Request",
+                             "paths must be a non-empty JSON array")
+            return
+
+        reindex = data.get("reindex", False)
+        if not isinstance(reindex, bool):
+            self._send_error(400, "Bad Request", "reindex must be a boolean")
+            return
+
+        validated: list = []
+        for raw_path in paths:
+            if not isinstance(raw_path, str) or not raw_path.strip():
+                self._send_error(400, "Bad Request",
+                                 "each path must be a non-empty string")
+                return
+            if not os.path.isabs(raw_path):
+                self._send_error(400, "Bad Request",
+                                 "path must be absolute")
+                return
+            abs_path = os.path.abspath(raw_path)
+            if not os.path.exists(abs_path):
+                self._send_error(404, "Not Found",
+                                 "path does not exist")
+                return
+            if not os.path.isdir(abs_path):
+                self._send_error(400, "Bad Request",
+                                 "path is not a directory")
+                return
+            validated.append(abs_path)
+
+        global _index_thread
+        with _index_job_lock:
+            if _index_thread is not None and _index_thread.is_alive():
+                self._send_error(409, "Conflict",
+                                 "an indexing job is already running")
+                return
+            _reset_index_state_locked()
+            thread = threading.Thread(
+                target=self._run_index_job,
+                args=(validated, reindex),
+                daemon=True,
+            )
+            _index_thread = thread
+            thread.start()
+
+        self._send_json(202, {"status": "scheduled"})
+
+    def _run_index_job(self, folders: list, reindex: bool) -> None:
+        """Worker: run index_folder() off the request thread, exactly one at a time."""
+        scanner = _artifact_scanner
+        if scanner is None:
+            with _index_job_lock:
+                _index_state["indexing_in_progress"] = False
+                _index_state["last_error"] = "Indexing unavailable."
+            return
+
+        running = {"processed": 0, "skipped": 0, "errors": 0}
+        last_error: Optional[str] = None
+        total = len(folders)
+
+        def _live_update(payload: Dict[str, Any]) -> None:
+            # Live, accumulating progress. Exposes only counts, never paths
+            # beyond the folder being indexed or file contents.
+            with _index_job_lock:
+                _index_state["processed"] = running["processed"] + payload["processed"]
+                _index_state["skipped"] = running["skipped"] + payload["skipped"]
+                _index_state["errors"] = running["errors"] + payload["errors"]
+
+        for done, folder in enumerate(folders, start=1):
+            with _index_job_lock:
+                _index_state["current_folder"] = folder
+            # Serialize against concurrent search reads of the HNSW index.
+            if not _rw_lock.acquire_write(timeout=30.0):
+                last_error = "Indexing timed out waiting for readers."
+                break
+            try:
+                result = scanner.index_folder(
+                    folder,
+                    force_reindex=reindex,
+                    progress_callback=_live_update,
+                )
+                running["processed"] += result.get("processed", 0)
+                running["skipped"] += result.get("skipped", 0)
+                running["errors"] += result.get("errors", 0)
+            except Exception as exc:
+                # Capture safely; never crash the HTTP server.
+                last_error = _safe_index_error(exc)
+            finally:
+                _rw_lock.release_write()
+            with _index_job_lock:
+                _index_state["progress_percent"] = int((done / total) * 100) if total else 100
+
+        with _index_job_lock:
+            _index_state["processed"] = running["processed"]
+            _index_state["skipped"] = running["skipped"]
+            _index_state["errors"] = running["errors"]
+            _index_state["current_folder"] = None
+            _index_state["indexing_in_progress"] = False
+            _index_state["progress_percent"] = 100
+            if last_error is None:
+                _index_state["last_indexed_ms"] = int(time.time() * 1000)
+                _index_state["last_error"] = None
+            else:
+                _index_state["last_error"] = last_error
+
+    def _handle_index_status(self) -> None:
+        with _index_job_lock:
+            status = dict(_index_state)
+        self._send_json(200, status)
 
     def _handle_static(self, parsed_path: str) -> None:
         asset = _resolve_static_asset(parsed_path)
@@ -394,6 +669,9 @@ class LifeSearchServer:
             self.server.server_close()
         if self._server_thread is not None:
             self._server_thread.join(timeout=5.0)
+        # Wait for the indexing worker to finish cleanly; we never forcibly
+        # kill the thread. If it is still running, join it (bounded wait).
+        _join_index_worker(timeout=30.0)
         self._shutdown_event.set()
 
     def wait_for_shutdown(self) -> None:

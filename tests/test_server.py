@@ -37,6 +37,7 @@ from src.server.app import (
     get_status_info,
     STATIC_DIR,
 )
+import src.server.app as server_app
 from src.server.mapping import (
     map_search_result,
     map_search_results,
@@ -640,3 +641,256 @@ class TestFrontendSanity:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+# ---------------------------------------------------------------------------
+# Phase C: HTTP indexing worker + API tests
+# ---------------------------------------------------------------------------
+class _FakeSlowScanner:
+    """Scanner whose index_folder sleeps, used to hold a job in-progress."""
+
+    def index_folder(self, folder_path, force_reindex=False, progress_callback=None):
+        time.sleep(0.5)
+        if progress_callback is not None:
+            progress_callback({
+                "processed": 1,
+                "skipped": 0,
+                "errors": 0,
+                "current": folder_path,
+                "total": None,
+            })
+        return {"processed": 1, "skipped": 0, "errors": 0}
+
+
+class _FakeFailingScanner:
+    """Scanner whose index_folder always raises (secret-free message)."""
+
+    def index_folder(self, folder_path, force_reindex=False, progress_callback=None):
+        raise RuntimeError("SECRET_DB_PATH_/tmp/leak details should not surface")
+
+
+class TestIndexingAPI:
+    """Tests for POST /index and GET /index/status (Phase C)."""
+
+    def setup_method(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.db_path = os.path.join(self.temp_dir.name, "lifesearch.db")
+        self.source_dir = os.path.join(self.temp_dir.name, "source")
+        os.makedirs(self.source_dir, exist_ok=True)
+        for i in range(3):
+            create_text_file(
+                os.path.join(self.source_dir, f"doc{i}.txt"),
+                f"unique-term-{i} content about project life",
+            )
+        # A plain file (not a directory) for validation tests.
+        self.a_file = os.path.join(self.temp_dir.name, "note.txt")
+        create_text_file(self.a_file, "plain file, not a directory")
+
+        self.port = _find_free_port()
+        self.server = LifeSearchServer(host="127.0.0.1", port=self.port)
+        self.server.start(self.db_path)
+        time.sleep(0.2)
+        # Capture the real scanner so tests can restore it after injecting fakes.
+        self.real_scanner = server_app._artifact_scanner
+
+    def teardown_method(self):
+        if hasattr(self, "server"):
+            try:
+                self.server.shutdown()
+            except Exception:
+                pass
+        # Always restore the real scanner so other tests are unaffected.
+        server_app._artifact_scanner = getattr(self, "real_scanner", None)
+        if hasattr(self, "temp_dir"):
+            self.temp_dir.cleanup()
+
+    def _make_request(self, method, path, body=None):
+        conn = HTTPConnection("127.0.0.1", self.port, timeout=10)
+        headers = {"Content-Type": "application/json"} if body is not None else {}
+        try:
+            if body is not None:
+                conn.request(method, path, json.dumps(body), headers)
+            else:
+                conn.request(method, path)
+            response = conn.getresponse()
+            data = response.read().decode("utf-8")
+            return response.status, data
+        finally:
+            conn.close()
+
+    def _wait_for_index_done(self, timeout=30.0):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            status, data = self._make_request("GET", "/index/status")
+            if status != 200:
+                continue
+            body = json.loads(data)
+            if not body["indexing_in_progress"]:
+                return body
+            time.sleep(0.05)
+        raise AssertionError("indexing did not finish within timeout")
+
+    # 1. valid folder -> 202
+    def test_post_index_valid_folder_returns_202(self):
+        status, data = self._make_request("POST", "/index", {"paths": [self.source_dir]})
+        assert status == 202
+        assert json.loads(data)["status"] == "scheduled"
+        self._wait_for_index_done()
+
+    # 2. malformed JSON -> 400
+    def test_post_index_malformed_json_returns_400(self):
+        conn = HTTPConnection("127.0.0.1", self.port, timeout=10)
+        conn.request("POST", "/index", "not valid json", {"Content-Type": "application/json"})
+        response = conn.getresponse()
+        data = response.read().decode("utf-8")
+        conn.close()
+        assert response.status == 400
+        assert "traceback" not in data.lower()
+
+    # 3. missing paths -> 400
+    def test_post_index_missing_paths_returns_400(self):
+        status, _ = self._make_request("POST", "/index", {"reindex": True})
+        assert status == 400
+
+    # 4. relative path -> 400
+    def test_post_index_relative_path_returns_400(self):
+        status, _ = self._make_request("POST", "/index", {"paths": ["relative/path"]})
+        assert status == 400
+
+    # 5. nonexistent folder -> 400/404
+    def test_post_index_nonexistent_folder_returns_404(self):
+        status, _ = self._make_request("POST", "/index", {"paths": ["/no/such/dir/xyz123"]})
+        assert status in (400, 404)
+
+    # 6. file instead of directory -> 400
+    def test_post_index_file_instead_of_directory_returns_400(self):
+        status, _ = self._make_request("POST", "/index", {"paths": [self.a_file]})
+        assert status == 400
+
+    # 7. second concurrent POST -> 409
+    def test_post_index_second_concurrent_returns_409(self):
+        server_app._artifact_scanner = _FakeSlowScanner()
+        try:
+            s1, _ = self._make_request("POST", "/index", {"paths": [self.source_dir]})
+            assert s1 == 202
+            s2, data = self._make_request("POST", "/index", {"paths": [self.source_dir]})
+            assert s2 == 409
+            body = json.loads(data)
+            assert body["error"]["code"] == 409
+        finally:
+            server_app._artifact_scanner = self.real_scanner
+        self._wait_for_index_done()
+
+    # 8. status before any indexing
+    def test_get_index_status_before_indexing(self):
+        status, data = self._make_request("GET", "/index/status")
+        assert status == 200
+        body = json.loads(data)
+        assert body["indexing_in_progress"] is False
+        assert body["current_folder"] is None
+        assert body["last_indexed_ms"] is None
+        assert body["processed"] == 0
+        assert body["errors"] == 0
+
+    # 9. status during indexing
+    def test_get_index_status_during_indexing(self):
+        server_app._artifact_scanner = _FakeSlowScanner()
+        try:
+            status, _ = self._make_request("POST", "/index", {"paths": [self.source_dir]})
+            assert status == 202
+            # Query quickly, while the slow job is still running.
+            st, data = self._make_request("GET", "/index/status")
+            assert st == 200
+            body = json.loads(data)
+            assert body["indexing_in_progress"] is True
+            assert body["current_folder"] == self.source_dir
+        finally:
+            server_app._artifact_scanner = self.real_scanner
+        self._wait_for_index_done()
+
+    # 10. status after completion
+    def test_get_index_status_after_completion(self):
+        status, _ = self._make_request("POST", "/index", {"paths": [self.source_dir]})
+        assert status == 202
+        body = self._wait_for_index_done()
+        assert body["indexing_in_progress"] is False
+        assert body["current_folder"] is None
+
+    # 11. progress / counts update
+    def test_index_progress_and_counts_update(self):
+        status, _ = self._make_request("POST", "/index", {"paths": [self.source_dir]})
+        assert status == 202
+        body = self._wait_for_index_done()
+        assert body["progress_percent"] == 100
+        assert body["processed"] == 3
+        assert body["skipped"] == 0
+        assert body["errors"] == 0
+
+    # 12. successful completion sets last_indexed_ms
+    def test_index_success_sets_last_indexed_ms(self):
+        status, _ = self._make_request("POST", "/index", {"paths": [self.source_dir]})
+        assert status == 202
+        body = self._wait_for_index_done()
+        assert isinstance(body["last_indexed_ms"], int)
+        assert body["last_indexed_ms"] > 0
+        assert body["last_error"] is None
+
+    # 13. indexing failure is captured safely
+    def test_index_failure_captured_safely(self):
+        server_app._artifact_scanner = _FakeFailingScanner()
+        try:
+            status, _ = self._make_request("POST", "/index", {"paths": [self.source_dir]})
+            assert status == 202
+            body = self._wait_for_index_done()
+            assert body["indexing_in_progress"] is False
+            assert body["last_error"] is not None
+            # No secret / traceback leakage.
+            assert "SECRET_DB_PATH" not in body["last_error"]
+            assert "traceback" not in body["last_error"].lower()
+            # Failure must not update last_indexed_ms.
+            assert body["last_indexed_ms"] is None
+        finally:
+            server_app._artifact_scanner = self.real_scanner
+
+    # 14. server remains usable after indexing failure
+    def test_server_usable_after_index_failure(self):
+        server_app._artifact_scanner = _FakeFailingScanner()
+        try:
+            self._make_request("POST", "/index", {"paths": [self.source_dir]})
+            self._wait_for_index_done()
+        finally:
+            server_app._artifact_scanner = self.real_scanner
+        # A subsequent real job is accepted and works.
+        status, _ = self._make_request("POST", "/index", {"paths": [self.source_dir]})
+        assert status == 202
+        body = self._wait_for_index_done()
+        assert body["indexing_in_progress"] is False
+        # Status endpoint still responds.
+        st, _ = self._make_request("GET", "/index/status")
+        assert st == 200
+
+    # 15. existing /search continues working after indexing
+    def test_search_works_after_indexing(self):
+        status, _ = self._make_request("POST", "/index", {"paths": [self.source_dir]})
+        assert status == 202
+        self._wait_for_index_done()
+        st, data = self._make_request("POST", "/search", {"query": "unique-term-1", "k": 10})
+        assert st == 200
+        results = json.loads(data)["results"]
+        assert any("doc0" in r.get("file_name", "") for r in results)
+
+    # 16. server shutdown handles the worker correctly
+    def test_shutdown_handles_worker(self):
+        server_app._artifact_scanner = _FakeSlowScanner()
+        try:
+            status, _ = self._make_request("POST", "/index", {"paths": [self.source_dir]})
+            assert status == 202
+            # Shutdown must join the still-running worker instead of killing it.
+            self.server.shutdown()
+            assert not self.server._server_thread.is_alive()
+        finally:
+            server_app._artifact_scanner = self.real_scanner
+        # Worker finished (joined), not forcibly killed.
+        time.sleep(0.6)
+        assert server_app._index_thread is not None
+        assert not server_app._index_thread.is_alive()
