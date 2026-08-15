@@ -15,6 +15,7 @@ Security posture (Phase A):
 """
 
 import json
+import logging
 import os
 import threading
 import time
@@ -25,6 +26,8 @@ from src.artifacts.scanner import ArtifactScanner
 from src.artifacts.store import ArtifactStore
 from src.feedback.store import FeedbackStore
 from src.feedback.rerank import apply_feedback_rerank
+from src.events.model import Event
+from src.events.store import EventStore
 from src.search.engine import SearchEngine
 from src.ingest.orchestrator import run_ingest, run_ingest_folder
 from src.server.mapping import (
@@ -118,6 +121,9 @@ _index_db_path: Optional[str] = None
 # Feedback signal store (Phase C4). Isolated from the search/artifact stores;
 # opens its own connection to the same database file.
 _feedback_store: Optional[FeedbackStore] = None
+# Event store (C8-6A): records FILE_OPENED recency events on its own connection
+# to the same database (mirrors the feedback store pattern).
+_event_store: Optional[EventStore] = None
 
 
 def _close_feedback_store() -> None:
@@ -247,7 +253,7 @@ def init_stack(db_path: Optional[str] = None) -> None:
     delegates to ``build_stack`` so the server shares the exact same wiring
     as the CLI commands.
     """
-    global _search_engine, _artifact_scanner, _index_thread, _feedback_store
+    global _search_engine, _artifact_scanner, _index_thread, _feedback_store, _event_store
 
     # Release any previously-initialized handles to avoid leaking file
     # descriptors between in-process server restarts (e.g. across tests).
@@ -277,12 +283,20 @@ def init_stack(db_path: Optional[str] = None) -> None:
     # stack (same resolution rule as build_stack) but owns its own connection.
     resolved = db_path or ArtifactStore.default_db_path()
     _feedback_store = FeedbackStore(resolved)
+    _event_store = EventStore(resolved)
 
 
 def _close_current_stack() -> None:
-    global _search_engine, _artifact_scanner, _feedback_store
+    global _search_engine, _artifact_scanner, _feedback_store, _event_store
     _artifact_scanner = None
     _close_feedback_store()
+    store = _event_store
+    _event_store = None
+    if store is not None:
+        try:
+            store.close()
+        except Exception:
+            pass
     engine = _search_engine
     if engine is None:
         return
@@ -306,6 +320,12 @@ def get_feedback_store() -> FeedbackStore:
     if _feedback_store is None:
         raise RuntimeError("Feedback store not initialized. Call init_stack() first.")
     return _feedback_store
+
+
+def get_event_store() -> EventStore:
+    if _event_store is None:
+        raise RuntimeError("Event store not initialized. Call init_stack() first.")
+    return _event_store
 
 
 def get_status_info() -> Dict[str, Any]:
@@ -521,6 +541,17 @@ class SearchRequestHandler(BaseHTTPRequestHandler):
                     self.log_error("Feedback re-ranking skipped: %s", type(fb_exc).__name__)
             took_ms = int((time.time() - start) * 1000)
             response = build_search_response(results, took_ms)
+            # C8-6B: surface recency metadata (last_opened_ms) on each ResultCard
+            # without altering the relevance score. Read from the artifact store.
+            store = getattr(engine, "artifact_store", None)
+            if store is not None:
+                for card in response.get("results", []):
+                    try:
+                        art_row = store.get_artifact(int(card["document_id"]))
+                        if art_row is not None:
+                            card["last_opened_ms"] = art_row["last_opened_ms"]
+                    except Exception:
+                        pass
             self._send_json(200, response)
         except Exception as exc:  # SearchEngine/infra failure -> 500
             # Log server-side only; never expose internals to the client.
@@ -671,6 +702,20 @@ class SearchRequestHandler(BaseHTTPRequestHandler):
 
     def _handle_feedback(self) -> None:
         """POST /feedback: capture a user ranking signal (click/ignore/pin)."""
+        # Bounded request size for this lightweight endpoint (C8-5D). The generic
+        # 1 MiB cap in _read_json_body still applies; this is a tighter, explicit
+        # guard so a single feedback POST can never be abused.
+        _FEEDBACK_MAX_BYTES = 64 * 1024
+        cl = self.headers.get("Content-Length")
+        if cl is not None:
+            try:
+                if int(cl) > _FEEDBACK_MAX_BYTES:
+                    self._send_error(413, "Payload Too Large", "Feedback request too large")
+                    return
+            except ValueError:
+                self._send_error(400, "Bad Request", "Invalid Content-Length header")
+                return
+
         data, error = self._read_json_body()
         if error:
             self._send_error(400, "Bad Request", error)
@@ -728,6 +773,34 @@ class SearchRequestHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    def _record_open(self, doc_id: int) -> None:
+        """Best-effort recency recording for a document open.
+
+        Updates last_opened_ms and emits a FILE_OPENED event. Any failure is
+        logged and swallowed so it can never turn a successful document read
+        into a 500.
+        """
+        try:
+            engine = get_search_engine()
+            store = getattr(engine, "artifact_store", None)
+            if store is not None:
+                store.update_last_opened(doc_id)
+            event_store = get_event_store()
+            event_store.append_event(
+                Event.from_dict(
+                    {
+                        "type": "FILE_OPENED",
+                        "source": "http",
+                        "source_kind": "filesystem",
+                        "artifact_id": doc_id,
+                    }
+                )
+            )
+        except Exception as _open_exc:
+            logging.getLogger(__name__).warning(
+                "Recency open recording failed (ignored): %s", _open_exc
+            )
+
     def _handle_document(self, parsed_path: str) -> None:
         prefix = "/document/"
         id_part = parsed_path[len(prefix):].split("/", 1)[0]
@@ -745,6 +818,10 @@ class SearchRequestHandler(BaseHTTPRequestHandler):
             if row is None:
                 self._send_error(404, "Not Found", "Document not found")
                 return
+            # Record the open as recency metadata (best-effort; never fails the read).
+            self._record_open(doc_id)
+            # Re-read so the response reflects the just-recorded open time.
+            row = store.get_artifact(doc_id)
             # Expose only existing, user-safe artifact fields. The id is
             # validated as an integer and used for a DB lookup only; it is
             # never interpreted as a filesystem path.
@@ -754,6 +831,7 @@ class SearchRequestHandler(BaseHTTPRequestHandler):
                 "path": row["path"],
                 "mime_type": row["mime_type"],
                 "size": row["size"],
+                "last_opened_ms": row["last_opened_ms"],
                 "created_at": row["created_at"],
                 "modified_at": row["modified_at"],
                 "indexed_at": row["indexed_at"],
