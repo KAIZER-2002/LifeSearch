@@ -1,5 +1,7 @@
+import logging
 import os
 import sqlite3
+import time
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Optional
 
@@ -18,6 +20,16 @@ class ArtifactStore:
         self._ensure_data_folder()
         self.conn = sqlite3.connect(self.db_path, check_same_thread=check_same_thread)
         self.conn.row_factory = sqlite3.Row
+        # Durability hardening (C8-5A): WAL + foreign-key enforcement.
+        try:
+            self.conn.execute("PRAGMA journal_mode=WAL")
+            self.conn.execute("PRAGMA foreign_keys=ON")
+        except sqlite3.Error as _durable_exc:
+            logging.getLogger(__name__).warning(
+                "SQLite durability PRAGMA (WAL/foreign_keys) failed; "
+                "durability guarantees may not hold: %s",
+                _durable_exc,
+            )
         self._initialize_schema()
 
     @staticmethod
@@ -57,6 +69,11 @@ class ArtifactStore:
             );
             """
         )
+        # C8-6A: add last_opened_ms (recency metadata). Idempotent migration so
+        # existing databases gain the column without data loss.
+        cols = [r[1] for r in self.conn.execute("PRAGMA table_info(artifacts)")]
+        if "last_opened_ms" not in cols:
+            self.conn.execute("ALTER TABLE artifacts ADD COLUMN last_opened_ms INTEGER")
         self.conn.commit()
 
     def close(self) -> None:
@@ -165,6 +182,7 @@ class ArtifactStore:
             return []
         sql = (
             "SELECT a.id, a.path, a.file_name, a.mime_type, a.size, a.modified_at, "
+            "a.last_opened_ms, "
             "bm25(artifact_fts) AS rank, snippet(artifact_fts, 3, '[', ']', '...', 10) AS snippet "
             "FROM artifact_fts "
             "JOIN artifacts a ON artifact_fts.rowid = a.id "
@@ -206,6 +224,24 @@ class ArtifactStore:
     def is_artifact_missing(self, path: str) -> bool:
         row = self.get_artifact_by_path(path)
         return bool(row and row["missing"])
+
+    def list_present_artifact_ids(self) -> List[int]:
+        """Return ids of all non-missing artifacts (used for derived-data pruning)."""
+        rows = self.conn.execute("SELECT id FROM artifacts WHERE missing = 0").fetchall()
+        return [int(row[0]) for row in rows]
+
+    def update_last_opened(self, artifact_id: int) -> None:
+        """Record that an artifact was just opened (recency metadata only).
+
+        Uses current epoch milliseconds; safe to call repeatedly; does NOT
+        modify created_at / modified_at / indexed_at. Unknown ids are ignored.
+        """
+        now_ms = int(time.time() * 1000)
+        self.conn.execute(
+            "UPDATE artifacts SET last_opened_ms = ? WHERE id = ?",
+            (now_ms, artifact_id),
+        )
+        self.conn.commit()
 
     def list_artifacts_in_folder(self, folder_path: str, include_missing: bool = False) -> List[sqlite3.Row]:
         normalized_folder = os.path.abspath(folder_path)
