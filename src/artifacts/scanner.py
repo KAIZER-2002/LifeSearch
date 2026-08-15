@@ -49,7 +49,11 @@ class ArtifactScanner:
         self.chunker = TextChunker()
 
     def index_folder(
-        self, folder_path: str, reindex_on_model_change: bool = False
+        self,
+        folder_path: str,
+        reindex_on_model_change: bool = False,
+        force_reindex: bool = False,
+        progress_callback: Optional[Any] = None,
     ) -> Dict[str, int]:
         base_folder = os.path.abspath(folder_path)
         if not os.path.isdir(base_folder):
@@ -84,6 +88,25 @@ class ArtifactScanner:
         skipped = 0
         errors = 0
 
+        def _emit_progress(current: Optional[str]) -> None:
+            # Optional, fire-and-forget progress reporting. Never required by
+            # existing callers. Exceptions raised inside the callback are
+            # swallowed so they cannot break indexing.
+            if progress_callback is None:
+                return
+            try:
+                progress_callback(
+                    {
+                        "processed": processed,
+                        "skipped": skipped,
+                        "errors": errors,
+                        "current": current,
+                        "total": None,
+                    }
+                )
+            except Exception:
+                logger.warning("progress_callback raised; ignoring to avoid breaking indexing.")
+
         for root, _dirs, files in os.walk(base_folder):
             for file_name in files:
                 path = os.path.abspath(os.path.join(root, file_name))
@@ -95,13 +118,15 @@ class ArtifactScanner:
                     stat = os.stat(path)
                 except OSError:
                     errors += 1
+                    _emit_progress(current=path)
                     continue
 
                 size = stat.st_size
                 modified_at = _format_timestamp(stat.st_mtime)
                 created_at = _format_timestamp(stat.st_ctime)
-                if not force_reembed and not self.store.artifact_needs_index(path, size, modified_at):
+                if not (force_reembed or force_reindex) and not self.store.artifact_needs_index(path, size, modified_at):
                     skipped += 1
+                    _emit_progress(current=path)
                     continue
 
                 mime_type = self.EXTENSION_TO_MIME.get(extension, "application/octet-stream")
@@ -148,6 +173,8 @@ class ArtifactScanner:
 
                 except Exception:
                     errors += 1
+
+                _emit_progress(current=path)
 
         # Propagate deletions to the vector store so no orphan vectors remain
         # searchable for removed/missing artifacts.
