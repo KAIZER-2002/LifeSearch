@@ -155,6 +155,12 @@ def command_model(args: argparse.Namespace) -> int:
     return 1
 
 
+def command_acceptance(args: argparse.Namespace) -> int:
+    from src.acceptance import main_cli
+
+    return main_cli(json_path=getattr(args, "json", None), verbose=getattr(args, "verbose", True))
+
+
 def create_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="lifesearch")
     parser.add_argument("--db", help="Path to the SQLite database file.")
@@ -191,6 +197,16 @@ def create_parser() -> argparse.ArgumentParser:
     serve_parser.add_argument("--host", default="127.0.0.1", help="Host to bind to (default: 127.0.0.1)")
     serve_parser.add_argument("--port", type=int, default=30013, help="Port to listen on (default: 30013)")
 
+    acceptance_parser = subparsers.add_parser(
+        "acceptance", help="Run the end-to-end acceptance harness."
+    )
+    acceptance_parser.add_argument(
+        "--json", default=None, help="Path to write the JSON acceptance report."
+    )
+    acceptance_parser.add_argument(
+        "--verbose", action="store_true", help="Print human-readable output."
+    )
+
     return parser
 
 
@@ -207,6 +223,8 @@ def main(argv=None) -> int:
         return command_open(args)
     if args.command == "model":
         return command_model(args)
+    if args.command == "acceptance":
+        return command_acceptance(args)
     if args.command == "serve":
         return command_serve(args)
     parser.print_help()
