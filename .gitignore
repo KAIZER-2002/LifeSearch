@@ -14,3 +14,7 @@ ENV/
 Thumbs.db
 scripts/eval_results.json
 
+# Local embedding model artifacts (downloaded at runtime; never committed)
+models/
+*.onnx
+tokenizer.json

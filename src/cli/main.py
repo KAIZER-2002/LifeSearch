@@ -13,6 +13,7 @@ from src.memories.store import MemoryStore
 from src.search.engine import SearchEngine
 from src.server.app import command_serve
 from src.ingest.orchestrator import run_ingest
+from src import model_lifecycle
 
 
 DEFAULT_DB_ENV = "LIFESEARCH_DB"
@@ -123,6 +124,37 @@ def command_open(args: argparse.Namespace) -> int:
     return 0
 
 
+def command_model(args: argparse.Namespace) -> int:
+    model_command = getattr(args, "model_command", None)
+    model_dir = getattr(args, "model_dir", None)
+
+    if model_command == "status":
+        status = model_lifecycle.get_model_status(model_dir)
+        print(f"Model:    {status['model_id']}")
+        print(f"Installed: {status['installed']}")
+        print(f"Valid:     {status['valid']}")
+        print(f"Location:  {status['model_dir']}")
+        for fname, present in status["files"].items():
+            print(f"  - {fname}: {'present' if present else 'missing'}")
+        return 0
+
+    if model_command == "install":
+        print(f"Installing model {model_lifecycle.MODEL_ID}...")
+        if model_lifecycle.install_model(model_dir):
+            status = model_lifecycle.get_model_status(model_dir)
+            print(f"Model installed and validated at {status['model_dir']}")
+            return 0
+        print(
+            "Model installation failed. Check network access to the configured "
+            "model source and retry."
+        )
+        return 1
+
+    # No model subcommand provided.
+    print("Usage: lifesearch model <status|install>")
+    return 1
+
+
 def create_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="lifesearch")
     parser.add_argument("--db", help="Path to the SQLite database file.")
@@ -145,6 +177,16 @@ def create_parser() -> argparse.ArgumentParser:
     open_parser = subparsers.add_parser("open", help="Open an indexed artifact.")
     open_parser.add_argument("artifact_id", type=int, help="Artifact ID to open.")
 
+    model_parser = subparsers.add_parser("model", help="Manage the embedding model.")
+    model_sub = model_parser.add_subparsers(dest="model_command")
+    model_sub.add_parser("status", help="Show model install/validity status.")
+    model_install_parser = model_sub.add_parser(
+        "install", help="Download and validate the embedding model."
+    )
+    model_install_parser.add_argument(
+        "--model-dir", default=None, help="Optional directory to install the model into."
+    )
+
     serve_parser = subparsers.add_parser("serve", help="Start the HTTP search server.")
     serve_parser.add_argument("--host", default="127.0.0.1", help="Host to bind to (default: 127.0.0.1)")
     serve_parser.add_argument("--port", type=int, default=30013, help="Port to listen on (default: 30013)")
@@ -163,6 +205,8 @@ def main(argv=None) -> int:
         return command_search(args)
     if args.command == "open":
         return command_open(args)
+    if args.command == "model":
+        return command_model(args)
     if args.command == "serve":
         return command_serve(args)
     parser.print_help()
