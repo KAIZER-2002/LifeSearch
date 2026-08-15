@@ -233,6 +233,10 @@ body {
   color: var(--ok);
   border-color: rgba(61, 220, 151, 0.35);
 }
+.recency-badge {
+  color: var(--accent);
+  border-color: rgba(120, 170, 255, 0.35);
+}
 .card-snippet {
   margin: 10px 0 0;
   color: var(--text);
@@ -501,6 +505,14 @@ body {
   box-shadow: 0 0 0 3px rgba(79, 140, 255, 0.25);
 }
 .index-options {
+  font-size: 13px;
+  color: var(--text-dim);
+}
+.sort-control {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  margin: 10px 0 0;
   font-size: 13px;
   color: var(--text-dim);
 }

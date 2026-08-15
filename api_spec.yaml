@@ -55,7 +55,7 @@ paths:
                   description: Absolute paths to reindex
                 priority:
                   type: boolean
-                  description: Whether to prioritize this reindex
+                  description: Whether to prioritize this reindex. Accepted by the server but currently ignored (no behavioral effect yet).
       responses:
         '202':
           description: Reindex scheduled
@@ -162,8 +162,10 @@ components:
           type: string
         last_opened_ms:
           type: integer
+          description: Last time the document was opened (epoch ms). Populated when the document is opened via the CLI or UI; null if never opened.
         thumbnail_path:
           type: string
+          description: Path to a cached thumbnail. Not yet populated by the current server (reserved for future UX).
     DocumentResponse:
       type: object
       properties:
@@ -188,6 +190,10 @@ components:
               type: integer
             indexed_at:
               type: integer
+            last_opened_ms:
+              type: integer
+              nullable: true
+              description: Last time the document was opened (epoch ms). Populated when the document is opened via the CLI or UI; null if never opened.
             metadata_json:
               type: string
         extracted_text:
@@ -206,6 +212,13 @@ components:
           type: boolean
         indexing_progress_percent:
           type: number
+        model_available:
+          type: boolean
+          description: Whether a usable embedding model is currently loaded.
+        model_id:
+          type: string
+          nullable: true
+          description: Loaded embedding model id, or null if no model is available.
     FeedbackRequest:
       type: object
       properties:
@@ -260,5 +273,6 @@ x-examples:
         created_at: 1715610000000
         modified_at: 1715613600000
         indexed_at: 1715617200000
+        last_opened_ms: 1715635200000
         metadata_json: "{\"paths\":[\"C:\\Users\\You\\Downloads\\qdrant_notes.pdf\"]}"
       extracted_text: "Qdrant is a vector database optimized for semantic search..."

@@ -17,12 +17,14 @@
   var errorState = document.getElementById("error-state");
   var errorText = document.getElementById("error-text");
   var loadingState = document.getElementById("loading-state");
+  var recencySortEl = document.getElementById("result-sort");
 
   var modal = document.getElementById("doc-modal");
   var modalTitle = document.getElementById("doc-title");
   var modalBody = document.getElementById("doc-body");
 
   var lastQuery = "";
+  var lastResults = null;
 
   function showState(name) {
     emptyState.hidden = true;
@@ -50,6 +52,33 @@
   function formatScore(score) {
     var s = typeof score === "number" ? score : 0;
     return Math.round(s * 100) / 100;
+  }
+
+  // C8-6C: human-readable recency label for last_opened_ms (epoch ms).
+  // null/0/non-number -> "Never opened"; otherwise a relative time string.
+  // This is display-only metadata and never affects search relevance.
+  function formatLastOpened(ms) {
+    if (ms === null || ms === undefined || ms === 0 || typeof ms !== "number") {
+      return "Never opened";
+    }
+    var diff = Date.now() - ms;
+    if (diff < 0) diff = 0;
+    var sec = Math.floor(diff / 1000);
+    if (sec < 45) return "Just now";
+    var min = Math.floor(sec / 60);
+    if (min < 1) return "Just now";
+    if (min < 60) return min + (min === 1 ? " minute ago" : " minutes ago");
+    var hr = Math.floor(min / 60);
+    if (hr < 24) return hr + (hr === 1 ? " hour ago" : " hours ago");
+    var days = Math.floor(hr / 24);
+    if (days === 1) return "Yesterday";
+    if (days < 7) return days + " days ago";
+    var weeks = Math.floor(days / 7);
+    if (weeks < 5) return weeks + (weeks === 1 ? " week ago" : " weeks ago");
+    var months = Math.floor(days / 30);
+    if (months < 12) return months + (months === 1 ? " month ago" : " months ago");
+    var years = Math.floor(days / 365);
+    return years + (years === 1 ? " year ago" : " years ago");
   }
 
   function formatBytes(bytes) {
@@ -104,6 +133,8 @@
     var snippet = escapeHtml(result.snippet || "");
     var score = formatScore(result.score);
     var why = escapeHtml(result.why || "");
+    var recencyLabel = formatLastOpened(result.last_opened_ms);
+    var recencyBadge = '<span class="badge recency-badge" title="Last opened">' + escapeHtml(recencyLabel) + "</span>";
     var path = escapeHtml(result.path || "");
 
     var mimeBadge = mime ? '<span class="badge mime-badge">' + mime + "</span>" : "";
@@ -131,7 +162,7 @@
       '<article class="result-card" data-doc-id="' + docId + '">' +
         '<header class="card-header">' +
           '<h3 class="card-title">' + fileName + "</h3>" +
-          '<div class="card-badges">' + mimeBadge + scoreBadge + "</div>" +
+          '<div class="card-badges">' + mimeBadge + scoreBadge + recencyBadge + "</div>" +
         "</header>" +
         (snippet ? '<p class="card-snippet">' + snippet + "</p>" : "") +
         (why ? '<p class="card-why"><span class="why-label">Why:</span> ' + why + "</p>" : "") +
@@ -151,6 +182,7 @@
     var took = typeof data.took_ms === "number" ? data.took_ms : null;
 
     if (results.length === 0) {
+      lastResults = [];
       noResultsText.textContent =
         "No results found" + (lastQuery ? ' for “' + lastQuery + "”" : "") + ".";
       showState("no-results");
@@ -158,11 +190,29 @@
       return;
     }
 
-    resultsEl.innerHTML = results.map(renderCard).join("");
-    showState("results");
+    lastResults = results;
+    renderSortedCards();
     var status = "Found " + results.length + " result" + (results.length === 1 ? "" : "s");
     if (took !== null) status += " in " + took + " ms";
     statusLine.textContent = status;
+  }
+
+  // C8-6C: optional client-side sort. Only reorders results already returned
+  // by the server; never changes server relevance ranking or scores. Default
+  // ("relevance") preserves the server's ordering.
+  function renderSortedCards() {
+    if (!lastResults) return;
+    var mode = recencySortEl && recencySortEl.value === "recency" ? "recency" : "relevance";
+    var ordered = lastResults.slice();
+    if (mode === "recency") {
+      ordered.sort(function (a, b) {
+        var av = (typeof a.last_opened_ms === "number" && a.last_opened_ms > 0) ? a.last_opened_ms : -1;
+        var bv = (typeof b.last_opened_ms === "number" && b.last_opened_ms > 0) ? b.last_opened_ms : -1;
+        return bv - av; // most-recent first; nulls (never opened) last
+      });
+    }
+    resultsEl.innerHTML = ordered.map(renderCard).join("");
+    showState("results");
   }
 
   function collectFilters() {
@@ -254,6 +304,12 @@
     }
     runSearch(q);
   });
+
+  // C8-6C: optional client-side recency sort. Only reorders already-returned
+  // results; server relevance ranking is never affected.
+  if (recencySortEl) {
+    recencySortEl.addEventListener("change", renderSortedCards);
+  }
 
   // Event delegation for "View details" and feedback buttons.
   resultsEl.addEventListener("click", function (e) {

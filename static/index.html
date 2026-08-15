@@ -52,6 +52,14 @@
       </details>
 
       <p id="status-line" class="status-line" role="status" aria-live="polite"></p>
+
+      <label class="sort-control" title="Sort only reorders results already returned by the server; relevance ranking is unchanged.">
+        Sort:
+        <select id="result-sort" class="search-input">
+          <option value="relevance">Relevance (default)</option>
+          <option value="recency">Recently opened</option>
+        </select>
+      </label>
     </section>
 
     <section id="index-section" class="index-section" aria-label="Index folders">
