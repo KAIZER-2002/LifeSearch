@@ -1,0 +1,44 @@
+[project]
+name = "life-search"
+version = "1.0.0"
+description = "Local-first personal search over your activity"
+requires-python = ">=3.9"
+license = "MIT"
+keywords = ["search", "memory", "episodes", "events"]
+
+dependencies = [
+    "PyPDF2>=3.0.1",
+    "python-docx>=1.2.0",
+    "lxml>=6.1.1",
+    "Pillow>=12.2.0",
+    "rapidocr-onnxruntime>=1.2.3",
+    "onnxruntime>=1.27.0",
+    "tokenizers>=0.21.0",
+    "numpy>=2.5.0",
+    "hnswlib>=0.8.0",
+]
+
+[project.scripts]
+lifesearch = "src.cli.main:main"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "build>=0.12.0",
+    "twine>=4.0.0",
+    "safety>=2.0.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/kaizer2002/life-search"
+Documentation = "https://lifesearch.docs.dev"
+"Bug Reports" = "https://github.com/kaizer2002/life-search/issues"
+Source = "https://github.com/kaizer2002/life-search"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["src*"]
+
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
