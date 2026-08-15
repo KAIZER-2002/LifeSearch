@@ -31,9 +31,9 @@ class SQLiteExactBackend:
     non-stable ``hash()``.
     """
 
-    def __init__(self, db_path: str) -> None:
+    def __init__(self, db_path: str, check_same_thread: bool = True) -> None:
         self.db_path = db_path
-        self.conn = sqlite3.connect(self.db_path)
+        self.conn = sqlite3.connect(self.db_path, check_same_thread=check_same_thread)
         self.conn.row_factory = sqlite3.Row
         self._initialize_schema()
 

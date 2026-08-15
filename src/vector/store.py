@@ -48,7 +48,7 @@ class VectorStore:
         ef_search: int = 64,
     ) -> None:
         self.db_path = db_path
-        self.sqlite = SQLiteExactBackend(db_path)
+        self.sqlite = SQLiteExactBackend(db_path, check_same_thread=False)
         self.ann_enabled = bool(ann_enabled) if ann_enabled is not None else _HNSW_AVAILABLE
         self.ef_search = ef_search
         self._ann_cache: Dict[Tuple[str, int], Optional[VectorIndexBackend]] = {}
