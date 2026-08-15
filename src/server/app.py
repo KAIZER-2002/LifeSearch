@@ -26,6 +26,7 @@ from src.artifacts.store import ArtifactStore
 from src.feedback.store import FeedbackStore
 from src.feedback.rerank import apply_feedback_rerank
 from src.search.engine import SearchEngine
+from src.ingest.orchestrator import run_ingest, run_ingest_folder
 from src.server.mapping import (
     build_search_response,
     build_status_response,
@@ -95,6 +96,9 @@ _index_state: Dict[str, Any] = {
     "processed": 0,
     "skipped": 0,
     "errors": 0,
+    "events": 0,
+    "episodes": 0,
+    "memories": 0,
     "current_folder": None,
     "last_indexed_ms": None,
     "last_error": None,
@@ -107,6 +111,9 @@ _index_job_lock = threading.Lock()
 _rw_lock = _ReadWriteLock()
 # The scanner from build_stack (shares the same stores as the SearchEngine).
 _artifact_scanner: Optional[ArtifactScanner] = None
+# Resolved database path (set in init_stack) used by the indexing worker to
+# drive the ingestion orchestrator without reaching into scanner internals.
+_index_db_path: Optional[str] = None
 
 # Feedback signal store (Phase C4). Isolated from the search/artifact stores;
 # opens its own connection to the same database file.
@@ -149,6 +156,9 @@ def _reset_index_state_locked() -> None:
             "processed": 0,
             "skipped": 0,
             "errors": 0,
+            "events": 0,
+            "episodes": 0,
+            "memories": 0,
             "current_folder": None,
             "last_error": None,
         }
@@ -169,6 +179,9 @@ def _reset_index_state_full() -> None:
                 "processed": 0,
                 "skipped": 0,
                 "errors": 0,
+                "events": 0,
+                "episodes": 0,
+                "memories": 0,
                 "current_folder": None,
                 "last_indexed_ms": None,
                 "last_error": None,
@@ -256,6 +269,9 @@ def init_stack(db_path: Optional[str] = None) -> None:
     # scanner that shares the SearchEngine's stores so indexing populates
     # exactly what /search reads.
     _, _artifact_scanner, _search_engine = build_stack(db_path)
+    # Capture the resolved DB path for the indexing worker / orchestrator.
+    global _index_db_path
+    _index_db_path = _artifact_scanner.store.db_path if _artifact_scanner is not None else (db_path or ArtifactStore.default_db_path())
 
     # The feedback store shares the same on-disk database as the rest of the
     # stack (same resolution rule as build_stack) but owns its own connection.
@@ -587,7 +603,8 @@ class SearchRequestHandler(BaseHTTPRequestHandler):
                 _index_state["last_error"] = "Indexing unavailable."
             return
 
-        running = {"processed": 0, "skipped": 0, "errors": 0}
+        running = {"processed": 0, "skipped": 0, "errors": 0,
+                   "events": 0, "episodes": 0, "memories": 0}
         last_error: Optional[str] = None
         total = len(folders)
 
@@ -607,14 +624,19 @@ class SearchRequestHandler(BaseHTTPRequestHandler):
                 last_error = "Indexing timed out waiting for readers."
                 break
             try:
-                result = scanner.index_folder(
+                totals = run_ingest_folder(
+                    scanner,
                     folder,
-                    force_reindex=reindex,
+                    _index_db_path,
+                    reindex=reindex,
                     progress_callback=_live_update,
                 )
-                running["processed"] += result.get("processed", 0)
-                running["skipped"] += result.get("skipped", 0)
-                running["errors"] += result.get("errors", 0)
+                running["processed"] += totals.get("processed", 0)
+                running["skipped"] += totals.get("skipped", 0)
+                running["errors"] += totals.get("errors", 0)
+                running["events"] += totals.get("events", 0)
+                running["episodes"] += totals.get("episodes", 0)
+                running["memories"] += totals.get("memories", 0)
             except Exception as exc:
                 # Capture safely; never crash the HTTP server.
                 last_error = _safe_index_error(exc)
@@ -627,6 +649,9 @@ class SearchRequestHandler(BaseHTTPRequestHandler):
             _index_state["processed"] = running["processed"]
             _index_state["skipped"] = running["skipped"]
             _index_state["errors"] = running["errors"]
+            _index_state["events"] = running["events"]
+            _index_state["episodes"] = running["episodes"]
+            _index_state["memories"] = running["memories"]
             _index_state["current_folder"] = None
             _index_state["indexing_in_progress"] = False
             _index_state["progress_percent"] = 100

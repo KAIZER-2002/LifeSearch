@@ -11,6 +11,7 @@ from src.episodes.store import EpisodeStore
 from src.memories.store import MemoryStore
 from src.search.engine import SearchEngine
 from src.server.app import command_serve
+from src.ingest.orchestrator import run_ingest
 
 
 DEFAULT_DB_ENV = "LIFESEARCH_DB"
@@ -67,9 +68,13 @@ def build_stack(db_path: Optional[str] = None):
 
 
 def command_index(args: argparse.Namespace) -> int:
-    _, scanner, _ = build_stack(args.db)
-    result = scanner.index_folder(args.folder, reindex_on_model_change=args.reindex)
-    print(f"Indexed {result['processed']} files, skipped {result['skipped']} unchanged files, {result['errors']} errors.")
+    store, scanner, _ = build_stack(args.db)
+    totals = run_ingest(scanner, [args.folder], store.db_path, reindex=args.reindex)
+    print(
+        f"Indexed {totals['processed']} files, skipped {totals['skipped']} unchanged files, "
+        f"{totals['errors']} errors. Generated {totals['events']} events, "
+        f"{totals['episodes']} episodes, {totals['memories']} memories."
+    )
     return 0
 
 
