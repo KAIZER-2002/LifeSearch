@@ -287,7 +287,8 @@ def _close_current_stack() -> None:
     if engine is None:
         return
     for store in (getattr(engine, "artifact_store", None),
-                  getattr(engine, "vector_store", None)):
+                  getattr(engine, "vector_store", None),
+                  getattr(engine, "event_store", None)):
         try:
             if store is not None:
                 store.close()

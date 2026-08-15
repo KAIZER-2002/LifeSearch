@@ -8,6 +8,7 @@ from src.artifacts.extractor import Extractor
 from src.artifacts.scanner import ArtifactScanner
 from src.artifacts.store import ArtifactStore
 from src.episodes.store import EpisodeStore
+from src.events.store import EventStore
 from src.memories.store import MemoryStore
 from src.search.engine import SearchEngine
 from src.server.app import command_serve
@@ -57,10 +58,12 @@ def build_stack(db_path: Optional[str] = None):
     scanner = ArtifactScanner(store, extractor, vector_store=vector_store, embedding_engine=embedding_engine)
     episode_store = EpisodeStore(resolved)
     memory_store = MemoryStore(resolved)
+    event_store = EventStore(resolved)
     search_engine = SearchEngine(
         store,
         episode_store=episode_store,
         memory_store=memory_store,
+        event_store=event_store,
         vector_store=vector_store,
         embedding_engine=embedding_engine,
     )

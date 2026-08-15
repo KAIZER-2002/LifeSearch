@@ -12,6 +12,20 @@ from .temporal import TemporalParser, TimeRange
 from src.artifacts.store import ArtifactStore
 
 
+# ---------------------------------------------------------------------------
+# Evidence confidence classification (deterministic, LLM-free).
+#
+# Terminology follows docs/SEARCH.md ("confidence score with classification:
+# FACT (direct evidence), INFERENCE (derived via heuristics/models), GUESS
+# (low confidence)") and docs/ARCHITECTURE_REVIEW.md (evidence provenance is
+# FACT = direct observable, INFERENCE = derived via rules/models, GUESS =
+# low-confidence hypothesis; keep provenance distinct from retrieval score).
+# ---------------------------------------------------------------------------
+CONFIDENCE_FACT = "FACT"
+CONFIDENCE_INFERENCE = "INFERENCE"
+CONFIDENCE_GUESS = "GUESS"
+
+
 class SearchEngine:
     """
     Unified Contextual & Semantic Search Engine (Slice 7).
@@ -29,6 +43,7 @@ class SearchEngine:
         artifact_store: ArtifactStore,
         episode_store: Optional[Any] = None,
         memory_store: Optional[Any] = None,
+        event_store: Optional[Any] = None,
         vector_store: Optional[Any] = None,
         embedding_engine: Optional[Any] = None,
         min_semantic_similarity: float = 0.35,
@@ -36,6 +51,7 @@ class SearchEngine:
         self.artifact_store = artifact_store
         self.episode_store = episode_store
         self.memory_store = memory_store
+        self.event_store = event_store
         self.vector_store = vector_store
         self.embedding_engine = embedding_engine
         self.min_semantic_similarity = min_semantic_similarity
@@ -67,7 +83,12 @@ class SearchEngine:
             art_id = int(candidate["id"])
             episodes = self._get_episode_summaries(art_id)
             memories = self._get_memory_summaries(episodes)
-            evidence = self._build_evidence(episodes, memories)
+            # Evidence construction must never turn a search into a 500: any
+            # failure degrades to empty evidence for this candidate.
+            try:
+                evidence = self._build_evidence(art_id, candidate, episodes, memories)
+            except Exception:
+                evidence = []
             candidate["episodes"] = episodes
             candidate["memories"] = memories
             candidate["evidence"] = evidence
@@ -342,29 +363,197 @@ class SearchEngine:
                     )
         return memories
 
+    # ------------------------------------------------------------------
+    # Evidence construction (C8-2): real, classified source evidence
+    # ------------------------------------------------------------------
+    # Builds evidence from the runtime Events -> Episodes -> Memories data
+    # that the artifact participates in. Evidence is EMPTY when the artifact
+    # has no runtime-derived source data (events/episodes/memories), which
+    # preserves the prior "no context -> empty evidence" contract.
+    #
+    # Each evidence item carries:
+    #   type            - what the evidence points to: "event" | "episode" | "memory"
+    #   id              - the source id (event/episode/memory id)
+    #   confidence_type - "FACT" | "INFERENCE" | "GUESS" (provenance class)
+    #   confidence      - factual confidence of this evidence item (0..1)
+    #   source          - provenance label (event source name or store name)
+    #   source_kind     - "filesystem" | "simulated" | "derived"
+    #   title           - human-readable label
+    #   snippet         - source text when available, else ""
+    #   path            - source path / equivalent source info when available
+    #   timestamp       - source timestamp when available
+    #   artifact_id     - the document this evidence is attached to
+    #   (plus type-specific fields: event_type, event_count, topics, ...)
+    #
+    # The matched artifact itself is the direct FACT record and is surfaced
+    # via the result's own fields (id/path/file_name) and via the event
+    # evidence that references it (artifact_id + path + snippet).
+
     def _build_evidence(
         self,
+        artifact_id: int,
+        candidate: Dict[str, Any],
         episode_summaries: List[Dict[str, Any]],
         memory_summaries: List[Dict[str, Any]],
     ) -> List[Dict[str, Any]]:
         evidence: List[Dict[str, Any]] = []
-        for ep in episode_summaries:
-            evidence.append(
-                {
-                    "type": "episode",
-                    "id": ep["id"],
-                    "title": ep["title"],
-                    "start_ts": ep["start_ts"],
-                    "end_ts": ep["end_ts"],
-                }
-            )
-        for mem in memory_summaries:
-            evidence.append(
-                {
-                    "type": "memory",
-                    "id": mem["id"],
-                    "title": mem["title"],
-                    "topics": mem["topics"],
-                }
-            )
+
+        # 1) Direct event evidence (FACT). Events are immutable observations.
+        events = self._fetch_events_for_artifact(artifact_id)
+        for ev in sorted(events, key=lambda e: e.timestamp):
+            evidence.append(self._event_evidence(ev, artifact_id, candidate))
+
+        # 2) Episode evidence: INFERENCE when underpinning events resolve,
+        #    otherwise GUESS (provenance insufficient - never fabricated).
+        episodes = self._fetch_full_episodes_for_artifact(artifact_id)
+        for ep in episodes:
+            evidence.append(self._episode_evidence(ep, artifact_id, candidate))
+
+        # 3) Memory evidence: derived from episodes; same classification rule.
+        seen_memory_ids: set[str] = set()
+        for ep in episodes:
+            for mem in self._fetch_memories_for_episode(ep.id):
+                if mem.id in seen_memory_ids:
+                    continue
+                seen_memory_ids.add(mem.id)
+                evidence.append(self._memory_evidence(mem, artifact_id, candidate))
+
         return evidence
+
+    @staticmethod
+    def classify_confidence(*, direct: bool, has_direct_signals: bool) -> str:
+        """Deterministic, LLM-free confidence classification.
+
+        Rules (per docs/SEARCH.md and docs/ARCHITECTURE_REVIEW.md):
+          - FACT: the evidence is a direct observable record (an Event, or the
+            artifact's own stored record). No inference is involved.
+          - INFERENCE: the evidence is derived from multiple direct signals
+            (an Episode or Memory assembled from underlying Events) AND those
+            underpinning signals were confirmed via the event store.
+          - GUESS: the evidence is derived but the underpinning direct signals
+            could not be confirmed (event store absent or events missing). We
+            do NOT fabricate certainty, so the weakest supported class is used.
+
+        This is intentionally pure and side-effect free so classification is
+        reproducible and testable.
+        """
+        if direct:
+            return CONFIDENCE_FACT
+        return CONFIDENCE_INFERENCE if has_direct_signals else CONFIDENCE_GUESS
+
+    def _fetch_events_for_artifact(self, artifact_id: int) -> List[Any]:
+        if self.event_store is None:
+            return []
+        try:
+            return list(self.event_store.get_events_for_artifact(artifact_id))
+        except Exception:
+            return []
+
+    def _fetch_full_episodes_for_artifact(self, artifact_id: int) -> List[Any]:
+        if self.episode_store is None:
+            return []
+        try:
+            all_episodes = self.episode_store.get_episodes_for_artifact(artifact_id)
+            return sorted(all_episodes, key=lambda e: e.start_ts, reverse=True)[:3]
+        except Exception:
+            return []
+
+    def _fetch_memories_for_episode(self, episode_id: str) -> List[Any]:
+        if self.memory_store is None:
+            return []
+        try:
+            return list(self.memory_store.get_memories_for_episode(episode_id))
+        except Exception:
+            return []
+
+    def _episode_has_direct_signals(self, episode: Any) -> bool:
+        if self.event_store is None:
+            return False
+        for eid in getattr(episode, "event_ids", []) or []:
+            try:
+                if self.event_store.get_event(eid) is not None:
+                    return True
+            except Exception:
+                continue
+        return False
+
+    def _memory_has_direct_signals(self, memory: Any) -> bool:
+        if self.event_store is None:
+            return False
+        for eid in getattr(memory, "event_ids", []) or []:
+            try:
+                if self.event_store.get_event(eid) is not None:
+                    return True
+            except Exception:
+                continue
+        return False
+
+    def _event_evidence(
+        self, ev: Any, artifact_id: int, candidate: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        payload = getattr(ev, "payload", None) or {}
+        path = payload.get("path") or candidate.get("path") or ""
+        # Events carry no body text; the artifact's extracted snippet is the
+        # available source text (populated by FTS/semantic match). Empty when
+        # no source text exists (e.g. images).
+        snippet = candidate.get("snippet") or ""
+        return {
+            "type": "event",
+            "id": ev.id,
+            "confidence_type": self.classify_confidence(direct=True, has_direct_signals=False),
+            "confidence": float(getattr(ev, "event_confidence", 1.0)),
+            "source": getattr(ev, "source", ""),
+            "source_kind": getattr(ev, "source_kind", ""),
+            "event_type": getattr(ev, "type", ""),
+            "title": f"{getattr(ev, 'type', 'event')} ({getattr(ev, 'source_kind', '')})",
+            "snippet": snippet,
+            "path": path,
+            "timestamp": getattr(ev, "timestamp", ""),
+            "artifact_id": artifact_id,
+        }
+
+    def _episode_evidence(
+        self, ep: Any, artifact_id: int, candidate: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        has_signals = self._episode_has_direct_signals(ep)
+        return {
+            "type": "episode",
+            "id": ep.id,
+            "confidence_type": self.classify_confidence(
+                direct=False, has_direct_signals=has_signals
+            ),
+            "confidence": float(getattr(ep, "grouping_confidence", 0.0)),
+            "source": "episode",
+            "source_kind": "derived",
+            "title": getattr(ep, "title", ""),
+            "snippet": "",
+            "path": candidate.get("path") or "",
+            "timestamp": getattr(ep, "start_ts", ""),
+            "start_ts": getattr(ep, "start_ts", ""),
+            "end_ts": getattr(ep, "end_ts", ""),
+            "artifact_id": artifact_id,
+            "event_count": len(getattr(ep, "event_ids", []) or []),
+            "grouping_confidence": float(getattr(ep, "grouping_confidence", 0.0)),
+        }
+
+    def _memory_evidence(
+        self, mem: Any, artifact_id: int, candidate: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        has_signals = self._memory_has_direct_signals(mem)
+        return {
+            "type": "memory",
+            "id": mem.id,
+            "confidence_type": self.classify_confidence(
+                direct=False, has_direct_signals=has_signals
+            ),
+            "confidence": float(getattr(mem, "confidence", 0.0)),
+            "source": "memory",
+            "source_kind": "derived",
+            "title": getattr(mem, "title", ""),
+            # The deterministic template summary is the available source text.
+            "snippet": getattr(mem, "title", ""),
+            "path": candidate.get("path") or "",
+            "timestamp": getattr(mem, "start_ts", ""),
+            "artifact_id": artifact_id,
+            "topics": list(getattr(mem, "topics", []) or []),
+        }
