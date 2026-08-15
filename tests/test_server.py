@@ -1496,3 +1496,47 @@ class TestSearchFiltersAPI:
         _, data2 = self._search({"query": q})
         after = {r["document_id"]: r["score"] for r in data2["results"]}[str(doc_id)]
         assert after > base
+
+
+# ---------------------------------------------------------------------------
+# C7c: Browser UI must expose and wire the structured filter controls
+# ---------------------------------------------------------------------------
+class TestFilterUISanity:
+    """Static checks that the UI exposes and wires mime/date filter controls."""
+
+    def _read(self, name):
+        with open(os.path.join(STATIC_DIR, name), "r", encoding="utf-8") as fh:
+            return fh.read()
+
+    def test_filter_controls_exist(self):
+        html = self._read("index.html")
+        for needed in (
+            'id="filter-mime"',
+            'id="filter-from"',
+            'id="filter-to"',
+            'name="mime_types"',
+            'name="date_from"',
+            'name="date_to"',
+        ):
+            assert needed in html, needed
+
+    def test_app_js_references_filter_controls(self):
+        js = self._read("app.js")
+        assert '"filter-mime"' in js or "'filter-mime'" in js
+        assert '"filter-from"' in js or "'filter-from'" in js
+        assert '"filter-to"' in js or "'filter-to'" in js
+
+    def test_app_js_builds_filters_body(self):
+        js = self._read("app.js")
+        # Builds a filters object and includes it in the /search request body.
+        assert "collectFilters" in js
+        assert "body.filters" in js
+        # Empty controls must not send a meaningless filters object.
+        assert "return undefined" in js
+
+    def test_no_external_network_urls(self):
+        for name in ("index.html", "app.js", "styles.css"):
+            content = self._read(name)
+            assert "http://" not in content
+            assert "https://" not in content
+            assert "cdn." not in content

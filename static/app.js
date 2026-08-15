@@ -165,14 +165,52 @@
     statusLine.textContent = status;
   }
 
+  function collectFilters() {
+    var mimeEl = document.getElementById("filter-mime");
+    var fromEl = document.getElementById("filter-from");
+    var toEl = document.getElementById("filter-to");
+    var filters = {};
+
+    var mime = mimeEl && mimeEl.value ? mimeEl.value.trim() : "";
+    if (mime) {
+      filters.mime_types = mime
+        .split(",")
+        .map(function (s) { return s.trim(); })
+        .filter(Boolean);
+    }
+
+    var fromVal = fromEl && fromEl.value ? fromEl.value : "";
+    if (fromVal) {
+      var fromMs = Date.parse(fromVal + "T00:00:00Z");
+      if (!isNaN(fromMs)) filters.date_from = fromMs;
+    }
+
+    var toVal = toEl && toEl.value ? toEl.value : "";
+    if (toVal) {
+      var toMs = Date.parse(toVal + "T23:59:59.999Z");
+      if (!isNaN(toMs)) filters.date_to = toMs;
+    }
+
+    // Nothing selected -> omit filters entirely from the request.
+    if (!filters.mime_types && filters.date_from == null && filters.date_to == null) {
+      return undefined;
+    }
+    return filters;
+  }
+
   function runSearch(query) {
     lastQuery = query;
+    var filters = collectFilters();
     showState("loading");
     button.disabled = true;
+    var body = { query: query, k: 10 };
+    if (filters) {
+      body.filters = filters;
+    }
     fetch("/search", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ query: query, k: 10 }),
+      body: JSON.stringify(body),
     })
       .then(function (resp) {
         return resp.json().then(function (data) {

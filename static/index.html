@@ -34,6 +34,23 @@
         />
         <button type="submit" id="search-button" class="search-button">Search</button>
       </form>
+
+      <details id="filters-panel" class="filter-panel">
+        <summary class="filter-summary">Filters</summary>
+        <div class="index-options">
+          <input
+            id="filter-mime"
+            name="mime_types"
+            class="search-input"
+            type="text"
+            placeholder="MIME type, e.g. application/pdf or image"
+            autocomplete="off"
+          />
+          <input id="filter-from" name="date_from" class="search-input" type="date" title="From date" />
+          <input id="filter-to" name="date_to" class="search-input" type="date" title="To date" />
+        </div>
+      </details>
+
       <p id="status-line" class="status-line" role="status" aria-live="polite"></p>
     </section>
 
