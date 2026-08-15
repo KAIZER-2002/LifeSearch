@@ -190,6 +190,7 @@ class ArtifactScanner:
             "processed": processed,
             "skipped": skipped,
             "errors": errors,
+            "newly_missing": newly_missing,
         }
 
     def _hash_file(self, path: str) -> Optional[str]:

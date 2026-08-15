@@ -222,15 +222,23 @@ def test_run_ingest_deleted_file_no_crash_no_duplication(tmp_path):
     # Re-ingest simulates a later indexing pass after deletion.
     run_ingest_folder(scanner, str(folder), db)
 
+    # C8-5B: orphaned derived data for the deleted artifact is cleaned up,
+    # while data for still-present artifacts is preserved and not duplicated.
+    store = ArtifactStore(db)
+    a_row = store.get_artifact_by_path(os.path.abspath(f))
+    b_row = store.get_artifact_by_path(os.path.abspath(os.path.join(folder, "b.txt")))
+    store.close()
+    assert a_row is not None and bool(a_row["missing"]), "deleted artifact should be marked missing"
+    assert b_row is not None and not bool(b_row["missing"]), "present artifact must stay present"
+
     es = EventStore(db)
+    a_events = es.get_events_for_artifact(a_row["id"])
+    b_events = es.get_events_for_artifact(b_row["id"])
     n2 = len(es.query_events())
     es.close()
-    assert n2 == n1, "deletion must not cause duplicate events"
-
-    store = ArtifactStore(db)
-    row = store.get_artifact_by_path(os.path.abspath(f))
-    assert row is not None and bool(row["missing"]), "deleted artifact should be marked missing"
-    store.close()
+    assert len(a_events) == 0, "orphaned events for the deleted artifact must be cleaned up"
+    assert len(b_events) >= 1, "events for the present artifact must be preserved"
+    assert n2 == len(b_events), "no duplicate or orphaned events should remain after deletion"
 
 
 # ---------------------------------------------------------------------------
