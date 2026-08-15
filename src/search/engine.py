@@ -6,7 +6,7 @@ from typing import Any, Dict, List, Optional
 
 from .query import normalize_query
 from .query_parser import ParsedQuery, QueryParser
-from .ranking import rank_candidates
+from .ranking import rank_candidates, parse_iso_utc
 from .result import SearchResult
 from .temporal import TemporalParser, TimeRange
 from src.artifacts.store import ArtifactStore
@@ -47,6 +47,7 @@ class SearchEngine:
         query: str,
         limit: int = 20,
         reference_date: Optional[datetime] = None,
+        filters: Optional[Dict[str, Any]] = None,
     ) -> List[SearchResult]:
         if not query or not query.strip():
             return []
@@ -57,6 +58,7 @@ class SearchEngine:
             time_range = self.temporal_parser.parse(parsed.time_expression, reference_date=reference_date)
 
         candidates = self._retrieve_candidates(parsed, time_range, limit)
+        candidates = self._apply_structured_filters(candidates, filters)
         if not candidates:
             return []
 
@@ -198,6 +200,95 @@ class SearchEngine:
                             candidates_map[art_id] = cand
 
         return list(candidates_map.values())
+
+    # ------------------------------------------------------------------
+    # Structured API filters (C7)
+    # ------------------------------------------------------------------
+    # Applied uniformly AFTER candidate retrieval and BEFORE enrichment /
+    # ranking. This preserves the existing hybrid ranking: filters only
+    # include/exclude candidates; they never alter scores. The input list
+    # is never mutated; a new list is returned.
+
+    @staticmethod
+    def _apply_structured_filters(
+        candidates: List[Dict[str, Any]],
+        filters: Optional[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        if not filters:
+            return candidates
+
+        mime_types = filters.get("mime_types")
+        date_from = SearchEngine._coerce_epoch_ms(filters.get("date_from"))
+        date_to = SearchEngine._coerce_epoch_ms(filters.get("date_to"))
+
+        # No supported, usable keys -> behave exactly as before.
+        if not mime_types and date_from is None and date_to is None:
+            return candidates
+        if mime_types is not None and not isinstance(mime_types, list):
+            mime_types = None
+
+        filtered: List[Dict[str, Any]] = []
+        for cand in candidates:
+            if not SearchEngine._candidate_matches_mime(cand, mime_types):
+                continue
+            if not SearchEngine._candidate_matches_date(cand, date_from, date_to):
+                continue
+            filtered.append(cand)
+        return filtered
+
+    @staticmethod
+    def _coerce_epoch_ms(value: Any) -> Optional[int]:
+        """Accept int epoch-ms; reject bool (an int subclass) and non-ints."""
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, int):
+            return value
+        return None
+
+    @staticmethod
+    def _candidate_matches_mime(
+        cand: Dict[str, Any], mime_types: Optional[List[str]]
+    ) -> bool:
+        if not mime_types:
+            return True
+        cand_mime = str(cand.get("mime_type") or "").lower()
+        for entry in mime_types:
+            f = str(entry or "").lower().strip()
+            if not f:
+                continue
+            if cand_mime == f:
+                return True
+            # Major-type matching: "image" matches "image/png".
+            if cand_mime.startswith(f + "/"):
+                return True
+        return False
+
+    @staticmethod
+    def _candidate_matches_date(
+        cand: Dict[str, Any],
+        date_from: Optional[int],
+        date_to: Optional[int],
+    ) -> bool:
+        if date_from is None and date_to is None:
+            return True
+        ts = SearchEngine._modified_at_to_epoch_ms(cand.get("modified_at"))
+        # Malformed/missing timestamps fail safely when a bound is active.
+        if ts is None:
+            return False
+        if date_from is not None and ts < date_from:
+            return False
+        if date_to is not None and ts > date_to:
+            return False
+        return True
+
+    @staticmethod
+    def _modified_at_to_epoch_ms(value: Any) -> Optional[int]:
+        if value is None:
+            return None
+        dt = parse_iso_utc(str(value))
+        if dt is None:
+            return None
+        return int(dt.timestamp() * 1000)
 
     # ------------------------------------------------------------------
     # Context Enrichment Helpers (Preserved)
