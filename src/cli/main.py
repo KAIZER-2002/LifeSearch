@@ -1,4 +1,5 @@
 import argparse
+import logging
 import os
 import subprocess
 import sys
@@ -9,6 +10,7 @@ from src.artifacts.scanner import ArtifactScanner
 from src.artifacts.store import ArtifactStore
 from src.episodes.store import EpisodeStore
 from src.events.store import EventStore
+from src.events.model import Event
 from src.memories.store import MemoryStore
 from src.search.engine import SearchEngine
 from src.server.app import command_serve
@@ -120,6 +122,28 @@ def command_open(args: argparse.Namespace) -> int:
     if artifact is None:
         print(f"Artifact not found: {args.artifact_id}")
         return 1
+    # Record the open as recency metadata (best-effort). A recency/event write
+    # failure must never break an otherwise valid open operation.
+    try:
+        store.update_last_opened(artifact["id"])
+        event_store = EventStore(args.db)
+        try:
+            event_store.append_event(
+                Event.from_dict(
+                    {
+                        "type": "FILE_OPENED",
+                        "source": "cli",
+                        "source_kind": "filesystem",
+                        "artifact_id": artifact["id"],
+                    }
+                )
+            )
+        finally:
+            event_store.close()
+    except Exception as _open_exc:
+        logging.getLogger(__name__).warning(
+            "Recency open recording failed (ignored): %s", _open_exc
+        )
     open_file(artifact["path"])
     return 0
 
