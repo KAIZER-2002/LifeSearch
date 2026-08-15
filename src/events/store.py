@@ -1,4 +1,5 @@
 import json
+import logging
 import os
 import sqlite3
 from typing import Any, Dict, List, Optional
@@ -12,6 +13,16 @@ class EventStore:
         self._ensure_data_folder()
         self.conn = sqlite3.connect(self.db_path, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
+        # Durability hardening (C8-5A): WAL + foreign-key enforcement.
+        try:
+            self.conn.execute("PRAGMA journal_mode=WAL")
+            self.conn.execute("PRAGMA foreign_keys=ON")
+        except sqlite3.Error as _durable_exc:
+            logging.getLogger(__name__).warning(
+                "SQLite durability PRAGMA (WAL/foreign_keys) failed; "
+                "durability guarantees may not hold: %s",
+                _durable_exc,
+            )
         self._initialize_schema()
 
     @staticmethod
@@ -132,6 +143,11 @@ class EventStore:
 
     def get_events_for_artifact(self, artifact_id: int) -> List[Event]:
         return self.query_events(artifact_id=artifact_id)
+
+    def delete_events_for_artifact(self, artifact_id: int) -> None:
+        """Remove all events bound to an artifact (C8-5B orphan cleanup)."""
+        self.conn.execute("DELETE FROM events WHERE artifact_id = ?", (artifact_id,))
+        self.conn.commit()
 
     def get_events_by_type(self, event_type: str) -> List[Event]:
         return self.query_events(event_type=event_type)

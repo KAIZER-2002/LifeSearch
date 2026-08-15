@@ -48,6 +48,45 @@ from src.memories.store import MemoryStore
 logger = logging.getLogger(__name__)
 
 
+def _cleanup_missing_derived_data(
+    artifact_store: "ArtifactStore",
+    event_store: "EventStore",
+    episode_store: "EpisodeStore",
+    memory_store: "MemoryStore",
+    vector_store: Optional[Any],
+    newly_missing: List[int],
+) -> None:
+    """Remove derived data for artifacts that just became missing/deleted (C8-5B).
+
+    Only touches data tied to artifacts that are no longer present. Episodes and
+    memories that are still supported by at least one present artifact are kept
+    (never blindly deleted just because one of several artifacts disappeared).
+    Best-effort: a cleanup failure must never invalidate the indexing result.
+    """
+    if not newly_missing:
+        return
+    present_ids = set(artifact_store.list_present_artifact_ids())
+    for aid in newly_missing:
+        try:
+            event_store.delete_events_for_artifact(aid)
+        except Exception:
+            pass
+        try:
+            if vector_store is not None:
+                vector_store.delete_artifact_chunks(aid)
+        except Exception:
+            pass
+    try:
+        episode_store.prune_dangling_episodes(present_ids)
+    except Exception:
+        pass
+    try:
+        present_episode_ids = {ep.id for ep in episode_store.get_episodes()}
+        memory_store.prune_dangling_memories(present_ids, present_episode_ids)
+    except Exception:
+        pass
+
+
 def run_ingest_folder(
     scanner: ArtifactScanner,
     folder: str,
@@ -120,6 +159,17 @@ def run_ingest_folder(
         if memories:
             memory_store.save_memories(memories)
         totals["memories"] = len(memories)
+
+        # 5. Clean up derived data for artifacts that became missing/deleted
+        #    during this run (C8-5B). Best-effort; never fails the indexing job.
+        _cleanup_missing_derived_data(
+            artifact_store,
+            event_store,
+            episode_store,
+            memory_store,
+            getattr(scanner, "vector_store", None),
+            result.get("newly_missing", []),
+        )
     finally:
         event_store.close()
         episode_store.close()

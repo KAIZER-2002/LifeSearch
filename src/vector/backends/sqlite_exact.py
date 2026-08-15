@@ -35,6 +35,16 @@ class SQLiteExactBackend:
         self.db_path = db_path
         self.conn = sqlite3.connect(self.db_path, check_same_thread=check_same_thread)
         self.conn.row_factory = sqlite3.Row
+        # Durability hardening (C8-5A): WAL + foreign-key enforcement.
+        try:
+            self.conn.execute("PRAGMA journal_mode=WAL")
+            self.conn.execute("PRAGMA foreign_keys=ON")
+        except sqlite3.Error as _durable_exc:
+            logger.warning(
+                "SQLite durability PRAGMA (WAL/foreign_keys) failed; "
+                "durability guarantees may not hold: %s",
+                _durable_exc,
+            )
         self._initialize_schema()
 
     # ------------------------------------------------------------------

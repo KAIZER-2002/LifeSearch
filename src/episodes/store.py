@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 from typing import Iterable, List, Optional
 
@@ -11,7 +12,16 @@ class EpisodeStore:
     def __init__(self, db_path: Optional[str] = None):
         self.db_path = db_path or self.default_db_path()
         self.conn = sqlite3.connect(self.db_path)
-        self.conn.execute("PRAGMA foreign_keys = ON")
+        # Durability hardening (C8-5A): WAL + foreign-key enforcement.
+        try:
+            self.conn.execute("PRAGMA journal_mode=WAL")
+            self.conn.execute("PRAGMA foreign_keys = ON")
+        except sqlite3.Error as _durable_exc:
+            logging.getLogger(__name__).warning(
+                "SQLite durability PRAGMA (WAL/foreign_keys) failed; "
+                "durability guarantees may not hold: %s",
+                _durable_exc,
+            )
         self._ensure_schema()
 
     @staticmethod
@@ -79,6 +89,22 @@ class EpisodeStore:
     def get_episodes_for_artifact(self, artifact_id: int) -> List[Episode]:
         episodes = self.get_episodes()
         return [episode for episode in episodes if artifact_id in episode.artifact_ids]
+
+    def prune_dangling_episodes(self, present_artifact_ids: set) -> int:
+        """Delete episodes whose referenced artifacts are all missing (C8-5B).
+
+        An episode supported by at least one still-present artifact is kept; we
+        never drop an episode merely because one of several supporting artifacts
+        disappeared.
+        """
+        removed = 0
+        for ep in self.get_episodes():
+            if not (set(ep.artifact_ids) & present_artifact_ids):
+                self.conn.execute("DELETE FROM episodes WHERE id = ?", (ep.id,))
+                removed += 1
+        if removed:
+            self.conn.commit()
+        return removed
 
     def _row_to_episode(self, row: tuple) -> Episode:
         _id, start_ts, end_ts, event_ids_json, artifact_ids_json, grouping_confidence, title, evidence_json = row

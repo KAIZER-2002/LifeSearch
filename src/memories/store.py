@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 from typing import Iterable, List, Optional
 
@@ -12,7 +13,16 @@ class MemoryStore:
     def __init__(self, db_path: Optional[str] = None):
         self.db_path = db_path or self.default_db_path()
         self.conn = sqlite3.connect(self.db_path)
-        self.conn.execute("PRAGMA foreign_keys = ON")
+        # Durability hardening (C8-5A): WAL + foreign-key enforcement.
+        try:
+            self.conn.execute("PRAGMA journal_mode=WAL")
+            self.conn.execute("PRAGMA foreign_keys = ON")
+        except sqlite3.Error as _durable_exc:
+            logging.getLogger(__name__).warning(
+                "SQLite durability PRAGMA (WAL/foreign_keys) failed; "
+                "durability guarantees may not hold: %s",
+                _durable_exc,
+            )
         self._ensure_schema()
 
     @staticmethod
@@ -96,6 +106,25 @@ class MemoryStore:
 
     def get_memories_for_artifact(self, artifact_id: int) -> List[Memory]:
         return [memory for memory in self.get_memories() if artifact_id in memory.artifact_ids]
+
+    def prune_dangling_memories(
+        self, present_artifact_ids: set, present_episode_ids: set
+    ) -> int:
+        """Delete memories with no surviving artifact and no surviving episode (C8-5B).
+
+        Mirrors prune_dangling_episodes: a memory derived from multiple sources is
+        kept if any supporting source still exists.
+        """
+        removed = 0
+        for mem in self.get_memories():
+            has_artifact = bool(set(mem.artifact_ids) & present_artifact_ids)
+            has_episode = bool(set(mem.episode_ids) & present_episode_ids)
+            if not has_artifact and not has_episode:
+                self.conn.execute("DELETE FROM memories WHERE id = ?", (mem.id,))
+                removed += 1
+        if removed:
+            self.conn.commit()
+        return removed
 
     def _row_to_memory(self, row: tuple) -> Memory:
         _id, start_ts, end_ts, episode_ids_json, event_ids_json, artifact_ids_json, title, topics_json, confidence, evidence_json = row
