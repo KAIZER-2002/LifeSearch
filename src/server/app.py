@@ -394,11 +394,16 @@ class SearchRequestHandler(BaseHTTPRequestHandler):
 
     def _validate_search_request(
         self, data: Dict[str, Any]
-    ) -> Tuple[Optional[str], Optional[int], Optional[str]]:
-        """Validate a /search request. Returns (query, k, error_message)."""
+    ) -> Tuple[Optional[str], Optional[int], Optional[Dict[str, Any]], Optional[str]]:
+        """Validate a /search request. Returns (query, k, filters, error_message).
+
+        ``filters`` is normalized to only the supported, validated keys
+        (mime_types, date_from, date_to). Unknown keys (app_origin, project)
+        are accepted for API compatibility but intentionally ignored.
+        """
         query = data.get("query")
         if not isinstance(query, str) or not query.strip():
-            return None, None, "query must be a non-empty string"
+            return None, None, None, "query must be a non-empty string"
 
         # 'k' controls the number of results.
         k = data.get("k", 10)
@@ -406,16 +411,40 @@ class SearchRequestHandler(BaseHTTPRequestHandler):
             try:
                 k = int(k)
             except (ValueError, TypeError):
-                return None, None, "k must be an integer"
+                return None, None, None, "k must be an integer"
         if k < 1 or k > 100:
-            return None, None, "k must be between 1 and 100"
+            return None, None, None, "k must be between 1 and 100"
 
-        # 'filters' is accepted for schema compatibility but not yet applied.
+        # 'filters' is accepted for schema compatibility. C7 implements
+        # mime_types / date_from / date_to; app_origin / project are reserved
+        # (accepted but ignored).
         filters = data.get("filters")
-        if filters is not None and not isinstance(filters, dict):
-            return None, None, "filters must be an object"
+        if filters is None:
+            return query.strip(), k, None, None
+        if not isinstance(filters, dict):
+            return None, None, None, "filters must be an object"
 
-        return query.strip(), k, None
+        normalized: Dict[str, Any] = {}
+
+        mime_types = filters.get("mime_types")
+        if mime_types is not None:
+            if not isinstance(mime_types, list) or not all(
+                isinstance(x, str) for x in mime_types
+            ):
+                return None, None, None, "filters.mime_types must be an array of strings"
+            normalized["mime_types"] = [str(x) for x in mime_types]
+
+        for key in ("date_from", "date_to"):
+            value = filters.get(key)
+            if value is None:
+                continue
+            # bool is a subclass of int; reject it explicitly.
+            if isinstance(value, bool) or not isinstance(value, int):
+                return None, None, None, f"filters.{key} must be an integer (epoch ms)"
+            normalized[key] = value
+
+        # Unknown keys (app_origin, project, ...) are ignored for compatibility.
+        return query.strip(), k, normalized, None
 
     # ---- routing ---------------------------------------------------------
 
@@ -451,7 +480,7 @@ class SearchRequestHandler(BaseHTTPRequestHandler):
             self._send_error(400, "Bad Request", error)
             return
 
-        query, k, error = self._validate_search_request(data)
+        query, k, filters, error = self._validate_search_request(data)
         if error:
             self._send_error(400, "Bad Request", error)
             return
@@ -465,7 +494,7 @@ class SearchRequestHandler(BaseHTTPRequestHandler):
 
         try:
             engine = get_search_engine()
-            results = engine.search(query, limit=k)
+            results = engine.search(query, limit=k, filters=filters)
             # Optional, fail-safe personalization: feedback re-ranking never
             # breaks search (any failure falls back to the original results).
             if _feedback_store is not None:

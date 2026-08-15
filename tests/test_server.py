@@ -1292,3 +1292,207 @@ class TestIndexingAPI:
         time.sleep(0.6)
         assert server_app._index_thread is not None
         assert not server_app._index_thread.is_alive()
+
+
+# ---------------------------------------------------------------------------
+# C7b: Structured search filters via POST /search
+# ---------------------------------------------------------------------------
+class TestSearchFiltersAPI:
+    """POST /search with structured filters (mime_types, date_from, date_to)."""
+
+    def setup_method(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.db_path = os.path.join(self.temp_dir.name, "lifesearch.db")
+        self.artifact_dir = os.path.join(self.temp_dir.name, "workspace")
+        os.makedirs(self.artifact_dir, exist_ok=True)
+
+        # Two text types so MIME filtering is meaningful. The query term
+        # "project" appears in each FILENAME so an unfiltered search returns
+        # both with a positive score (the engine drops score-0 results).
+        create_text_file(
+            os.path.join(self.artifact_dir, "notes project.txt"),
+            "searchable content about alpha",
+        )
+        create_text_file(
+            os.path.join(self.artifact_dir, "story project.md"),
+            "a markdown story about beta",
+        )
+
+        with ArtifactStore(self.db_path) as store:
+            scanner = ArtifactScanner(store, Extractor())
+            scanner.index_folder(self.artifact_dir)
+
+        self.port = _find_free_port()
+        self.server = LifeSearchServer(host="127.0.0.1", port=self.port)
+        self.server.start(self.db_path)
+        time.sleep(0.2)
+
+    def teardown_method(self):
+        if hasattr(self, "server"):
+            self.server.shutdown()
+        if hasattr(self, "temp_dir"):
+            self.temp_dir.cleanup()
+
+    def _search(self, body):
+        conn = HTTPConnection("127.0.0.1", self.port, timeout=10)
+        try:
+            conn.request("POST", "/search", json.dumps(body), {"Content-Type": "application/json"})
+            resp = conn.getresponse()
+            data = resp.read().decode("utf-8")
+            return resp.status, (json.loads(data) if data else None)
+        finally:
+            conn.close()
+
+    def _mimes(self, data):
+        return [r["mime_type"] for r in data["results"]]
+
+    def _doc_id(self, filename):
+        engine = server_app.get_search_engine()
+        store = engine.artifact_store
+        row = store.get_artifact_by_path(
+            os.path.abspath(os.path.join(self.artifact_dir, filename))
+        )
+        return int(row["id"])
+
+    def _record(self, doc_id, action, query):
+        conn = HTTPConnection("127.0.0.1", self.port, timeout=10)
+        try:
+            conn.request(
+                "POST",
+                "/feedback",
+                json.dumps({"query": query, "document_id": str(doc_id), "action": action}),
+                {"Content-Type": "application/json"},
+            )
+            return conn.getresponse().status
+        finally:
+            conn.close()
+
+    # --- no filter / regression -------------------------------------------
+    def test_no_filters_returns_both_types(self):
+        status, data = self._search({"query": "project"})
+        assert status == 200
+        mimes = self._mimes(data)
+        assert "text/plain" in mimes
+        assert "text/markdown" in mimes
+
+    # --- MIME --------------------------------------------------------------
+    def test_mime_filter_text_plain(self):
+        status, data = self._search(
+            {"query": "project", "filters": {"mime_types": ["text/plain"]}}
+        )
+        assert status == 200
+        assert self._mimes(data) == ["text/plain"]
+
+    def test_mime_filter_text_markdown(self):
+        status, data = self._search(
+            {"query": "project", "filters": {"mime_types": ["text/markdown"]}}
+        )
+        assert status == 200
+        assert self._mimes(data) == ["text/markdown"]
+
+    def test_mime_filter_major_type_text(self):
+        status, data = self._search(
+            {"query": "project", "filters": {"mime_types": ["text"]}}
+        )
+        assert status == 200
+        assert set(self._mimes(data)) == {"text/plain", "text/markdown"}
+
+    # --- dates -------------------------------------------------------------
+    def test_date_from_includes_recent(self):
+        now = int(time.time() * 1000)
+        status, data = self._search(
+            {"query": "project", "filters": {"date_from": now - 3_600_000}}
+        )
+        assert status == 200
+        assert len(data["results"]) >= 1
+
+    def test_date_to_future_window(self):
+        now = int(time.time() * 1000)
+        status, data = self._search(
+            {"query": "project", "filters": {"date_to": now + 3_600_000}}
+        )
+        assert status == 200
+        assert len(data["results"]) >= 1
+
+    def test_both_dates_window(self):
+        now = int(time.time() * 1000)
+        status, data = self._search(
+            {
+                "query": "project",
+                "filters": {"date_from": now - 3_600_000, "date_to": now + 3_600_000},
+            }
+        )
+        assert status == 200
+        assert len(data["results"]) >= 1
+
+    def test_date_out_of_range_excludes_all(self):
+        future = int((time.time() + 10 * 365 * 24 * 3600) * 1000)
+        status, data = self._search(
+            {"query": "project", "filters": {"date_from": future}}
+        )
+        assert status == 200
+        assert data["results"] == []
+
+    # --- validation ---------------------------------------------------------
+    def test_invalid_mime_types_not_array(self):
+        status, _ = self._search(
+            {"query": "project", "filters": {"mime_types": "text/plain"}}
+        )
+        assert status == 400
+
+    def test_invalid_mime_types_non_string_element(self):
+        status, _ = self._search(
+            {"query": "project", "filters": {"mime_types": ["text/plain", 5]}}
+        )
+        assert status == 400
+
+    def test_invalid_date_from_bool(self):
+        status, _ = self._search(
+            {"query": "project", "filters": {"date_from": True}}
+        )
+        assert status == 400
+
+    def test_invalid_date_from_string(self):
+        status, _ = self._search(
+            {"query": "project", "filters": {"date_from": "2024-01-01"}}
+        )
+        assert status == 400
+
+    def test_no_traceback_on_invalid_filter(self):
+        status, data = self._search(
+            {"query": "project", "filters": {"date_from": "bad"}}
+        )
+        assert status == 400
+        assert "traceback" not in json.dumps(data).lower()
+
+    # --- app_origin / project ignored --------------------------------------
+    def test_app_origin_accepted_ignored(self):
+        status, data = self._search(
+            {
+                "query": "project",
+                "filters": {"app_origin": "browser", "mime_types": ["text/plain"]},
+            }
+        )
+        assert status == 200
+        assert self._mimes(data) == ["text/plain"]
+
+    def test_project_accepted_ignored(self):
+        status, data = self._search(
+            {
+                "query": "project",
+                "filters": {"project": "life", "mime_types": ["text/markdown"]},
+            }
+        )
+        assert status == 200
+        assert self._mimes(data) == ["text/markdown"]
+
+    # --- C5 reranking still works -----------------------------------------
+    def test_reranking_still_works(self):
+        doc_id = self._doc_id("notes project.txt")
+        q = "project"
+        _, data1 = self._search({"query": q})
+        base = {r["document_id"]: r["score"] for r in data1["results"]}[str(doc_id)]
+        assert self._record(doc_id, "pin", q) == 200
+        _, data2 = self._search({"query": q})
+        after = {r["document_id"]: r["score"] for r in data2["results"]}[str(doc_id)]
+        assert after > base
